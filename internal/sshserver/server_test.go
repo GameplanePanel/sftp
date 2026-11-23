@@ -147,7 +147,7 @@ func newHarnessWith(t *testing.T, mutate func(*Config), api *fakeAPI, hf Handler
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestIdleConnectionIsClosed(t *testing.T) {
 
 func TestHandshakeIdleIsClosed(t *testing.T) {
 	h := newHarness(t, func(c *Config) { c.LoginTimeout = 100 * time.Millisecond }, &fakeAPI{})
-	raw, err := net.Dial("tcp", h.addr)
+	raw, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", h.addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestServeRejectsSecondCall(t *testing.T) {
 	if srv.Addr() != nil {
 		t.Fatal("Addr before Serve should be nil")
 	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -537,7 +537,7 @@ func TestMetricsRegistration(t *testing.T) {
 	}
 }
 
-func TestNilMetricsAreSafe(t *testing.T) {
+func TestNilMetricsAreSafe(_ *testing.T) {
 	var m *Metrics
 	m.AddBytes("read", 10)
 	m.login(loginOK)

@@ -3,6 +3,7 @@ package vfs
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -483,7 +484,7 @@ func listNames(t *testing.T, l sftp.ListerAt) []os.FileInfo {
 		n, err := l.ListAt(buf, off)
 		out = append(out, buf[:n]...)
 		off += int64(n)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return out
 		}
 		if err != nil {

@@ -188,7 +188,7 @@ func TestReadWholeFile(t *testing.T) {
 	if err != nil || n != 10 || string(buf) != "0123456789" {
 		t.Fatalf("ReadAt = %d %q %v, want 10 bytes", n, buf[:n], err)
 	}
-	if _, err := r.ReadAt(buf, 10); err != io.EOF {
+	if _, err := r.ReadAt(buf, 10); !errors.Is(err, io.EOF) {
 		t.Fatalf("read past end err = %v, want EOF", err)
 	}
 }
@@ -288,7 +288,7 @@ func TestReadShortReadReturnsError(t *testing.T) {
 	defer closeOrFail(t, r)
 	buf := make([]byte, 10)
 	n, err := r.ReadAt(buf, 0)
-	if n != 3 || err != io.EOF {
+	if n != 3 || !errors.Is(err, io.EOF) {
 		t.Fatalf("ReadAt past end = %d %v, want 3 and EOF", n, err)
 	}
 }

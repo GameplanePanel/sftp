@@ -121,6 +121,9 @@ func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
 			continue
 		}
 		if errors.Is(err, io.EOF) && (r.size < 0 || r.pos >= r.size) {
+			if n == len(p) {
+				return n, nil
+			}
 			return n, io.EOF
 		}
 		// The stream broke, or ended before the size seen at open. Retry once

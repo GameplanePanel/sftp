@@ -62,9 +62,9 @@ func TestExitCodeServeWithoutRequiredFlags(t *testing.T) {
 
 func fullServeEnv() map[string]string {
 	return map[string]string{
-		envHostKey:          "/keys",
-		envAPIURL:           "https://api.example",
-		envServiceTokenFile: "/token",
+		envHostKey:     "/keys",
+		envAPIURL:      "https://api.example",
+		envSvcAuthFile: "/token",
 	}
 }
 
@@ -118,8 +118,8 @@ func TestParseServeConfigRejectsBadInput(t *testing.T) {
 		args []string
 		env  map[string]string
 	}{
-		"missing host key":  {nil, map[string]string{envAPIURL: "x", envServiceTokenFile: "y"}},
-		"missing api url":   {nil, map[string]string{envHostKey: "x", envServiceTokenFile: "y"}},
+		"missing host key":  {nil, map[string]string{envAPIURL: "x", envSvcAuthFile: "y"}},
+		"missing api url":   {nil, map[string]string{envHostKey: "x", envSvcAuthFile: "y"}},
 		"missing token":     {nil, map[string]string{envHostKey: "x", envAPIURL: "y"}},
 		"bad idle env":      {nil, withEnv(fullServeEnv(), envIdleTimeout, "soon")},
 		"bad sessions env":  {nil, withEnv(fullServeEnv(), envMaxSessionsPerUser, "many")},

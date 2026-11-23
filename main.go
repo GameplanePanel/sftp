@@ -45,7 +45,7 @@ const (
 	envListen              = "GAMEPLANE_SFTP_LISTEN"
 	envHostKey             = "GAMEPLANE_SFTP_HOST_KEY"
 	envAPIURL              = "GAMEPLANE_SFTP_API_URL"
-	envServiceTokenFile    = "GAMEPLANE_SFTP_SERVICE_TOKEN_FILE"
+	envSvcAuthFile         = "GAMEPLANE_SFTP_SERVICE_TOKEN_FILE"
 	envCAFile              = "GAMEPLANE_SFTP_CA_FILE"
 	envIdleTimeout         = "GAMEPLANE_SFTP_IDLE_TIMEOUT"
 	envMaxSessionsPerUser  = "GAMEPLANE_SFTP_MAX_SESSIONS_PER_USER"
@@ -129,7 +129,7 @@ func parseServeConfig(args []string, getenv func(string) string, errOut io.Write
 	fs.StringVar(&c.Listen, "listen", envString(getenv, envListen, defaultListen), "address to accept SSH connections on")
 	fs.StringVar(&c.HostKeyPath, "host-key", getenv(envHostKey), "host key file or directory (required)")
 	fs.StringVar(&c.APIURL, "api-url", getenv(envAPIURL), "Gameplane API base URL, for example https://gameplane-api.gameplane.svc:8080 (required)")
-	fs.StringVar(&c.ServiceTokenFile, "service-token-file", getenv(envServiceTokenFile), "file holding the service token (required)")
+	fs.StringVar(&c.ServiceTokenFile, "service-token-file", getenv(envSvcAuthFile), "file holding the service token (required)")
 	fs.StringVar(&c.CAFile, "ca-file", getenv(envCAFile), "optional PEM bundle of extra CA certificates for the API")
 	fs.DurationVar(&c.IdleTimeout, "idle-timeout", idle, "close a connection with no traffic for this long")
 	fs.IntVar(&c.MaxSessionsPerUser, "max-sessions-per-user", maxSessions, "concurrent SSH connections allowed per user")
@@ -241,7 +241,7 @@ func runServe(args []string, getenv func(string) string, errOut io.Writer) error
 	if err != nil {
 		return err
 	}
-	l, err := net.Listen("tcp", cfg.Listen)
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
 	}

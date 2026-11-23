@@ -222,7 +222,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		go func() {
 			defer wg.Done()
 			defer s.untrack(raw)
-			s.handle(raw)
+			s.handle(ctx, raw)
 		}()
 	}
 	s.shutdown()
@@ -276,7 +276,7 @@ type connState struct {
 }
 
 // handle runs one TCP connection from handshake to close.
-func (s *Server) handle(raw net.Conn) {
+func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	remote := raw.RemoteAddr().String()
 	dc := &deadlineConn{Conn: raw}
 	dc.idle.Store(int64(s.cfg.LoginTimeout))
@@ -294,7 +294,7 @@ func (s *Server) handle(raw net.Conn) {
 	// take up to LoginTimeout, is not cut off by it.
 	dc.idle.Store(int64(max(s.cfg.IdleTimeout, s.cfg.LoginTimeout)))
 	dc.touch()
-	sess, err := s.establish(sconn)
+	sess, err := s.establish(ctx, sconn)
 	if err != nil {
 		return
 	}
@@ -335,15 +335,15 @@ func (s *Server) handle(raw net.Conn) {
 // were checked in the password callback. Public-key logins are checked here,
 // after the SSH layer has verified the signature, so the API only ever sees
 // keys the client proved it holds.
-func (s *Server) establish(sconn *ssh.ServerConn) (apiclient.Session, error) {
+func (s *Server) establish(ctx context.Context, sconn *ssh.ServerConn) (apiclient.Session, error) {
 	perms := sconn.Permissions
 	if perms == nil {
 		return apiclient.Session{}, errPermissionDenied
 	}
 	if line := perms.Extensions[extPublicKey]; line != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.LoginTimeout)
+		lctx, cancel := context.WithTimeout(ctx, s.cfg.LoginTimeout)
 		defer cancel()
-		sess, err := s.api.Login(ctx, apiclient.LoginRequest{
+		sess, err := s.api.Login(lctx, apiclient.LoginRequest{
 			Username:   sconn.User(),
 			PublicKey:  line,
 			RemoteAddr: sconn.RemoteAddr().String(),
@@ -545,12 +545,12 @@ func (c *deadlineConn) Read(p []byte) (int, error) {
 
 func (c *deadlineConn) Write(p []byte) (int, error) {
 	c.touch()
-	return c.Conn.Write(p)
+	return c.Write(p)
 }
 
 func (c *deadlineConn) touch() {
 	if d := time.Duration(c.idle.Load()); d > 0 {
-		_ = c.Conn.SetDeadline(time.Now().Add(d))
+		_ = c.SetDeadline(time.Now().Add(d))
 	}
 }
 
