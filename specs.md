@@ -79,7 +79,7 @@ On `--metrics-addr` at `/metrics` (private registry): `gameplane_sftp_sessions` 
 - An API session the server creates but does not use is ended with `POST /sftp/v1/sessions/end` (service token, body `{"sessionTokens": ["gpsftp_…"]}`): a login refused by the per-user cap (password or key), and a password login whose SSH handshake does not finish. A failed end call is only logged; the session still expires on its own.
 - Per-user caps are keyed by the lowercased API user name and enforced after authentication.
 - The session token is used only as the bearer for the API calls of its own connection and is never logged. Passwords and keys are never logged.
-- Before authentication completes, each read or write has a 10 s deadline, and `MaxAuthTries` is 3.
+- Before authentication completes, the handshake has an absolute deadline of `LoginTimeout` (10 s) from accept, so a client that drips bytes cannot hold a pre-auth slot longer; after it, each read or write has the idle-timeout deadline. `MaxAuthTries` is 3.
 
 ## Dependencies
 

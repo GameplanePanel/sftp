@@ -775,3 +775,49 @@ func TestNewRejectsNegativePreAuthCap(t *testing.T) {
 		t.Fatal("negative pre-auth cap accepted")
 	}
 }
+
+func TestSlowDripHandshakeIsCutAtDeadline(t *testing.T) {
+	const loginTimeout = 400 * time.Millisecond
+	h := newHarness(t, func(c *Config) { c.LoginTimeout = loginTimeout }, &fakeAPI{})
+	raw, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", h.addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+	start := time.Now()
+
+	// Send one byte of a never-ending version line every 50ms, well inside
+	// the per-read timeout. Only an absolute deadline can stop this.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		tick := time.NewTicker(50 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				if _, err := raw.Write([]byte("x")); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	if err := raw.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	buf := make([]byte, 64)
+	for {
+		if _, err := raw.Read(buf); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatal("slow-drip connection was not closed")
+			}
+			break
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("closed after %v, want about %v", elapsed, loginTimeout)
+	}
+}

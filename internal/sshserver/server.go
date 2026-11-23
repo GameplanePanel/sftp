@@ -344,6 +344,9 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, releasePreAuth func()
 	remote := raw.RemoteAddr().String()
 	dc := &deadlineConn{Conn: raw}
 	dc.idle.Store(int64(s.cfg.LoginTimeout))
+	// The handshake gets an absolute deadline, so a client that sends a byte
+	// now and then cannot keep its pre-auth slot past LoginTimeout.
+	dc.hard.Store(time.Now().Add(s.cfg.LoginTimeout).UnixNano())
 
 	sconn, chans, reqs, err := ssh.NewServerConn(dc, s.sshCfg)
 	// A password login already created an API session in the callback.
@@ -358,6 +361,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, releasePreAuth func()
 	}
 	defer func() { _ = sconn.Close() }()
 
+	dc.hard.Store(0)
 	// The SSH mux is already blocked in a read whose deadline came from the
 	// handshake. Push it out so a public-key login call to the API, which may
 	// take up to LoginTimeout, is not cut off by it.
@@ -621,10 +625,13 @@ func (s *Server) checkOnce(ctx context.Context) {
 }
 
 // deadlineConn pushes the connection deadline forward on every read and
-// write. idle holds the timeout in nanoseconds; zero means no deadline.
+// write. idle holds the timeout in nanoseconds; zero means no deadline. hard,
+// when non-zero, is an absolute deadline (Unix nanoseconds) that a touch never
+// moves past.
 type deadlineConn struct {
 	net.Conn
 	idle atomic.Int64
+	hard atomic.Int64
 }
 
 func (c *deadlineConn) Read(p []byte) (int, error) {
@@ -638,8 +645,17 @@ func (c *deadlineConn) Write(p []byte) (int, error) {
 }
 
 func (c *deadlineConn) touch() {
+	var deadline time.Time
 	if d := time.Duration(c.idle.Load()); d > 0 {
-		_ = c.SetDeadline(time.Now().Add(d))
+		deadline = time.Now().Add(d)
+	}
+	if h := c.hard.Load(); h != 0 {
+		if hd := time.Unix(0, h); deadline.IsZero() || hd.Before(deadline) {
+			deadline = hd
+		}
+	}
+	if !deadline.IsZero() {
+		_ = c.SetDeadline(deadline)
 	}
 }
 
