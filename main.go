@@ -19,10 +19,17 @@ var Version = "dev"
 var errUsage = errors.New("usage: sftp version")
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
+	os.Exit(exitCode(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// exitCode runs one subcommand and returns the process exit code: 0 on
+// success, 2 after printing the error to errOut.
+func exitCode(args []string, out, errOut io.Writer) int {
+	if err := run(args, out); err != nil {
+		_, _ = fmt.Fprintln(errOut, err)
+		return 2
 	}
+	return 0
 }
 
 // run dispatches one subcommand and writes its output to out.

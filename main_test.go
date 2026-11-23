@@ -33,3 +33,17 @@ func TestRunVersionWriteError(t *testing.T) {
 		t.Fatal("want an error when the output cannot be written")
 	}
 }
+
+func TestExitCode(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := exitCode([]string{"version"}, &out, &errOut); code != 0 || errOut.Len() != 0 {
+		t.Fatalf("exitCode(version) = %d, stderr %q", code, errOut.String())
+	}
+	out.Reset()
+	if code := exitCode([]string{"serve"}, &out, &errOut); code != 2 {
+		t.Fatalf("exitCode(serve) = %d, want 2", code)
+	}
+	if got := errOut.String(); got != errUsage.Error()+"\n" {
+		t.Fatalf("stderr = %q, want usage", got)
+	}
+}
