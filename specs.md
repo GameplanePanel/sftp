@@ -52,7 +52,7 @@ Exit code 2 with a message on stderr for a usage or startup error.
 ### Login
 
 - Password: the callback sends the full SSH username (including a `+target` suffix), the password and the client address to `POST /sftp/v1/login` with the service token.
-- Public key: the SSH layer verifies the signature, then the server logs in through the API with the key's authorized_keys line. Because the SSH library accepts the key before the API is asked, a refused key shows to the client as a connection that closes right after authentication, not as an authentication failure. Documented limitation.
+- Public key: the SSH layer verifies the signature, then (in `VerifiedPublicKeyCallback`, still during authentication) the server logs in through the API with the key's authorized_keys line. A key the API refuses fails only that authentication attempt, so the client tries its next key or falls back to the password. Each refused key is one failed login at the API.
 - Every failure is a generic "permission denied" to the client; the cause is only logged at debug level and counted in metrics.
 - A login as `user+server` or `user+namespace/server` roots the connection at that server. Otherwise the root lists the user's servers.
 
