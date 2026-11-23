@@ -137,10 +137,11 @@ func New(cfg Config, api API, hf HandlerFactory) (*Server, error) {
 		base:    context.Background(),
 	}
 	sc := &ssh.ServerConfig{
-		PasswordCallback:  s.passwordCallback,
-		PublicKeyCallback: s.publicKeyCallback,
-		MaxAuthTries:      maxAuthTries,
-		ServerVersion:     serverVersion,
+		PasswordCallback:          s.passwordCallback,
+		PublicKeyCallback:         s.publicKeyCallback,
+		VerifiedPublicKeyCallback: s.verifiedPublicKeyCallback,
+		MaxAuthTries:              maxAuthTries,
+		ServerVersion:             serverVersion,
 	}
 	for _, k := range cfg.HostKeys {
 		sc.AddHostKey(k)
@@ -358,7 +359,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, releasePreAuth func()
 	dc.hard.Store(time.Now().Add(s.cfg.LoginTimeout).UnixNano())
 
 	sconn, chans, reqs, err := ssh.NewServerConn(dc, s.sshCfg)
-	// A password login already created an API session in the callback.
+	// A password or public-key login already created an API session in its callback.
 	pwSess, hasPW := s.takePending(remote)
 	if err != nil {
 		s.log.Debug("ssh handshake ended", "remote", remote, "err", err)
@@ -372,8 +373,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, releasePreAuth func()
 
 	dc.hard.Store(0)
 	// The SSH mux is already blocked in a read whose deadline came from the
-	// handshake. Push it out so a public-key login call to the API, which may
-	// take up to LoginTimeout, is not cut off by it.
+	// handshake. Push it out to the session's own timeout.
 	dc.idle.Store(int64(max(s.cfg.IdleTimeout, s.cfg.LoginTimeout)))
 	dc.touch()
 	sess, err := s.establish(ctx, sconn, pwSess, hasPW)
@@ -415,10 +415,10 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, releasePreAuth func()
 	channels.Wait()
 }
 
-// establish returns the session for a finished handshake. Password logins
-// were checked in the password callback. Public-key logins are checked here,
-// after the SSH layer has verified the signature, so the API only ever sees
-// keys the client proved it holds.
+// establish returns the session for a finished handshake. Password and
+// public-key logins were both checked with the API during authentication (the
+// key only after the SSH layer verified its signature), and their session
+// travels in the permissions.
 func (s *Server) establish(ctx context.Context, sconn *ssh.ServerConn, pwSess apiclient.Session, hasPW bool) (apiclient.Session, error) {
 	perms := sconn.Permissions
 	if perms == nil {
@@ -426,20 +426,6 @@ func (s *Server) establish(ctx context.Context, sconn *ssh.ServerConn, pwSess ap
 			s.endSession(ctx, pwSess)
 		}
 		return apiclient.Session{}, errPermissionDenied
-	}
-	if line := perms.Extensions[extPublicKey]; line != "" {
-		lctx, cancel := context.WithTimeout(ctx, s.cfg.LoginTimeout)
-		defer cancel()
-		sess, err := s.api.Login(lctx, apiclient.LoginRequest{
-			Username:   sconn.User(),
-			PublicKey:  line,
-			RemoteAddr: sconn.RemoteAddr().String(),
-		})
-		if err != nil {
-			s.loginFailed(sconn.User(), sconn.RemoteAddr().String(), err)
-			return apiclient.Session{}, errPermissionDenied
-		}
-		return sess, nil
 	}
 	sess, err := sessionFromExtensions(perms.Extensions)
 	if err != nil {
@@ -496,6 +482,13 @@ func (s *Server) passwordCallback(conn ssh.ConnMetadata, pw []byte) (*ssh.Permis
 		s.loginFailed(conn.User(), conn.RemoteAddr().String(), err)
 		return nil, errPermissionDenied
 	}
+	return s.loggedIn(conn, sess)
+}
+
+// loggedIn finishes a login the API accepted during authentication: it
+// refuses a user already at the session cap and remembers the session until
+// the handshake ends.
+func (s *Server) loggedIn(conn ssh.ConnMetadata, sess apiclient.Session) (*ssh.Permissions, error) {
 	// Fast refusal for a user already at the cap. admit enforces it again
 	// after the handshake, which is the authoritative check.
 	if s.atLimit(sess.User) {
@@ -513,11 +506,37 @@ func (s *Server) passwordCallback(conn ssh.ConnMetadata, pw []byte) (*ssh.Permis
 }
 
 // publicKeyCallback only records the offered key. The SSH layer calls it
-// before the signature is checked, so the API is not asked here; establish
-// does that after the handshake.
+// before the signature is checked, so the API is not asked here;
+// verifiedPublicKeyCallback does that once the signature is verified.
 func (s *Server) publicKeyCallback(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
 	return &ssh.Permissions{Extensions: map[string]string{extPublicKey: line}}, nil
+}
+
+// verifiedPublicKeyCallback logs the user in through the API with a key whose
+// signature the SSH layer has verified. A key the API refuses fails only that
+// authentication attempt, so the client goes on to its next key or to the
+// password prompt instead of losing the connection.
+func (s *Server) verifiedPublicKeyCallback(conn ssh.ConnMetadata, _ ssh.PublicKey, perms *ssh.Permissions, _ string) (*ssh.Permissions, error) {
+	line := ""
+	if perms != nil {
+		line = perms.Extensions[extPublicKey]
+	}
+	if line == "" {
+		return nil, errPermissionDenied
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.LoginTimeout)
+	defer cancel()
+	sess, err := s.api.Login(ctx, apiclient.LoginRequest{
+		Username:   conn.User(),
+		PublicKey:  line,
+		RemoteAddr: conn.RemoteAddr().String(),
+	})
+	if err != nil {
+		s.loginFailed(conn.User(), conn.RemoteAddr().String(), err)
+		return nil, errPermissionDenied
+	}
+	return s.loggedIn(conn, sess)
 }
 
 func (s *Server) loginFailed(user, remote string, err error) {
