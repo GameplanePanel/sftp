@@ -352,7 +352,7 @@ func TestDownloadOffsets(t *testing.T) {
 	}{
 		{"from start", 0, "", http.StatusOK, "hello world", "hello world"},
 		{"range honoured", 5, "bytes=5-", http.StatusPartialContent, "world", "world"},
-		{"range ignored", 5, "bytes=5-", http.StatusOK, "hello world", "world"},
+		{"range ignored", 5, "bytes=5-", http.StatusOK, "hello world", " world"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
