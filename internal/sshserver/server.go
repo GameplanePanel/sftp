@@ -25,6 +25,7 @@ const (
 	defaultAddr          = ":2222"
 	defaultIdleTimeout   = 15 * time.Minute
 	defaultMaxSessions   = 4
+	defaultMaxPreAuth    = 64
 	defaultCheckInterval = 30 * time.Second
 	defaultLoginTimeout  = 10 * time.Second
 	acceptRetryDelay     = 100 * time.Millisecond
@@ -49,6 +50,9 @@ var errPermissionDenied = errors.New("permission denied")
 type API interface {
 	Login(ctx context.Context, r apiclient.LoginRequest) (apiclient.Session, error)
 	CheckSessions(ctx context.Context, tokens []string) ([]string, error)
+	// EndSession closes the API session a login created. The server calls it
+	// when it drops a connection whose login succeeded at the API.
+	EndSession(ctx context.Context, token string) error
 }
 
 // HandlerFactory builds the SFTP request handlers for one authenticated
@@ -69,6 +73,10 @@ type Config struct {
 	// MaxSessionsPerUser caps concurrent authenticated connections per user.
 	// Default 4.
 	MaxSessionsPerUser int
+	// MaxPreAuthConnections caps concurrent connections that have not yet
+	// finished authentication. A connection over the cap is closed at once.
+	// Default 64.
+	MaxPreAuthConnections int
 	// CheckInterval is how often the server asks the API which of its
 	// session tokens were revoked. Default 30s.
 	CheckInterval time.Duration
@@ -92,10 +100,12 @@ type Server struct {
 
 	mu       sync.Mutex
 	listener net.Listener
-	open     map[net.Conn]struct{} // every accepted connection, until it ends
-	tokens   map[string]*connState // session token -> authenticated connection
-	perUser  map[string]int        // lowercased user -> authenticated connections
-	closing  bool                  // set once Serve's context ends
+	open     map[net.Conn]struct{}        // every accepted connection, until it ends
+	tokens   map[string]*connState        // session token -> authenticated connection
+	perUser  map[string]int               // lowercased user -> authenticated connections
+	closing  bool                         // set once Serve's context ends
+	preAuth  int                          // connections still before authentication
+	pending  map[string]apiclient.Session // remote address -> password login awaiting handshake end
 }
 
 // New validates cfg and returns a Server. It does not listen.
@@ -122,6 +132,7 @@ func New(cfg Config, api API, hf HandlerFactory) (*Server, error) {
 		open:    make(map[net.Conn]struct{}),
 		tokens:  make(map[string]*connState),
 		perUser: make(map[string]int),
+		pending: make(map[string]apiclient.Session),
 	}
 	sc := &ssh.ServerConfig{
 		PasswordCallback:  s.passwordCallback,
@@ -146,11 +157,17 @@ func (c Config) withDefaults() (Config, error) {
 	if c.MaxSessionsPerUser < 0 {
 		return c, errors.New("sshserver: negative session cap")
 	}
+	if c.MaxPreAuthConnections < 0 {
+		return c, errors.New("sshserver: negative pre-auth connection cap")
+	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = defaultIdleTimeout
 	}
 	if c.MaxSessionsPerUser == 0 {
 		c.MaxSessionsPerUser = defaultMaxSessions
+	}
+	if c.MaxPreAuthConnections == 0 {
+		c.MaxPreAuthConnections = defaultMaxPreAuth
 	}
 	if c.CheckInterval == 0 {
 		c.CheckInterval = defaultCheckInterval
@@ -218,11 +235,18 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 			_ = raw.Close()
 			continue
 		}
+		if !s.acquirePreAuth() {
+			s.untrack(raw)
+			_ = raw.Close()
+			s.metrics.preAuthRejected()
+			s.log.Info("connection refused", "remote", raw.RemoteAddr().String(), "reason", "pre-auth cap")
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer s.untrack(raw)
-			s.handle(ctx, raw)
+			s.handle(ctx, raw, sync.OnceFunc(s.releasePreAuth))
 		}()
 	}
 	s.shutdown()
@@ -259,6 +283,43 @@ func (s *Server) track(c net.Conn) bool {
 	return true
 }
 
+// acquirePreAuth takes one pre-authentication slot, or reports that the cap
+// is reached.
+func (s *Server) acquirePreAuth() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.preAuth >= s.cfg.MaxPreAuthConnections {
+		return false
+	}
+	s.preAuth++
+	return true
+}
+
+func (s *Server) releasePreAuth() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preAuth--
+}
+
+// endSession tells the API to close a session this server created but will
+// not use. It runs on its own context so a shutdown does not skip it. A
+// failure is only logged: the session still expires on its own.
+func (s *Server) endSession(sess apiclient.Session) {
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.LoginTimeout)
+	defer cancel()
+	if err := s.api.EndSession(ctx, sess.Token); err != nil {
+		s.log.Debug("end session failed", "user", sess.User, "err", err)
+	}
+}
+
+func (s *Server) takePending(remote string) (apiclient.Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.pending[remote]
+	delete(s.pending, remote)
+	return sess, ok
+}
+
 func (s *Server) untrack(c net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -272,19 +333,27 @@ type connState struct {
 	user        string // API user name as returned by login
 	key         string // lowercased user, the per-user cap key
 	sftpStarted atomic.Bool
+	sessionOpen atomic.Bool // a session channel is currently accepted
 	revoked     atomic.Bool
 }
 
-// handle runs one TCP connection from handshake to close.
-func (s *Server) handle(ctx context.Context, raw net.Conn) {
+// handle runs one TCP connection from handshake to close. releasePreAuth
+// frees the connection's pre-authentication slot; it is safe to call twice.
+func (s *Server) handle(ctx context.Context, raw net.Conn, releasePreAuth func()) {
+	defer releasePreAuth()
 	remote := raw.RemoteAddr().String()
 	dc := &deadlineConn{Conn: raw}
 	dc.idle.Store(int64(s.cfg.LoginTimeout))
 
 	sconn, chans, reqs, err := ssh.NewServerConn(dc, s.sshCfg)
+	// A password login already created an API session in the callback.
+	pwSess, hasPW := s.takePending(remote)
 	if err != nil {
 		s.log.Debug("ssh handshake ended", "remote", remote, "err", err)
 		_ = raw.Close()
+		if hasPW {
+			s.endSession(pwSess)
+		}
 		return
 	}
 	defer func() { _ = sconn.Close() }()
@@ -294,7 +363,8 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	// take up to LoginTimeout, is not cut off by it.
 	dc.idle.Store(int64(max(s.cfg.IdleTimeout, s.cfg.LoginTimeout)))
 	dc.touch()
-	sess, err := s.establish(ctx, sconn)
+	sess, err := s.establish(ctx, sconn, pwSess, hasPW)
+	releasePreAuth()
 	if err != nil {
 		return
 	}
@@ -304,6 +374,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 
 	st := &connState{sconn: sconn, sess: sess, user: sess.User, key: strings.ToLower(sess.User)}
 	if !s.admit(st) {
+		s.endSession(sess)
 		s.metrics.login(loginLimit)
 		s.log.Info("login refused", "user", st.user, "remote", remote, "result", loginLimit)
 		return
@@ -322,9 +393,15 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 			_ = nc.Reject(ssh.UnknownChannelType, "only session channels")
 			continue
 		}
+		// One session channel at a time: a second one would only sit idle.
+		if !st.sessionOpen.CompareAndSwap(false, true) {
+			_ = nc.Reject(ssh.ResourceShortage, "one session channel per connection")
+			continue
+		}
 		channels.Add(1)
 		go func() {
 			defer channels.Done()
+			defer st.sessionOpen.Store(false)
 			s.serveSession(nc, st)
 		}()
 	}
@@ -335,9 +412,12 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 // were checked in the password callback. Public-key logins are checked here,
 // after the SSH layer has verified the signature, so the API only ever sees
 // keys the client proved it holds.
-func (s *Server) establish(ctx context.Context, sconn *ssh.ServerConn) (apiclient.Session, error) {
+func (s *Server) establish(ctx context.Context, sconn *ssh.ServerConn, pwSess apiclient.Session, hasPW bool) (apiclient.Session, error) {
 	perms := sconn.Permissions
 	if perms == nil {
+		if hasPW {
+			s.endSession(pwSess)
+		}
 		return apiclient.Session{}, errPermissionDenied
 	}
 	if line := perms.Extensions[extPublicKey]; line != "" {
@@ -356,6 +436,9 @@ func (s *Server) establish(ctx context.Context, sconn *ssh.ServerConn) (apiclien
 	}
 	sess, err := sessionFromExtensions(perms.Extensions)
 	if err != nil {
+		if hasPW {
+			s.endSession(pwSess)
+		}
 		return apiclient.Session{}, errPermissionDenied
 	}
 	return sess, nil
@@ -409,10 +492,16 @@ func (s *Server) passwordCallback(conn ssh.ConnMetadata, pw []byte) (*ssh.Permis
 	// Fast refusal for a user already at the cap. admit enforces it again
 	// after the handshake, which is the authoritative check.
 	if s.atLimit(sess.User) {
+		s.endSession(sess)
 		s.metrics.login(loginLimit)
 		s.log.Info("login refused", "user", sess.User, "remote", conn.RemoteAddr().String(), "result", loginLimit)
 		return nil, errPermissionDenied
 	}
+	// Remember the session until the handshake ends, so a connection dropped
+	// before it is used can still end it.
+	s.mu.Lock()
+	s.pending[conn.RemoteAddr().String()] = sess
+	s.mu.Unlock()
 	return &ssh.Permissions{Extensions: sessionExtensions(sess)}, nil
 }
 

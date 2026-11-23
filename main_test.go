@@ -158,3 +158,25 @@ func TestParseServeConfigDefaultNamespace(t *testing.T) {
 		t.Fatalf("flag namespace = %q, %v", c.DefaultNamespace, err)
 	}
 }
+
+func TestParseServeConfigMaxPreAuth(t *testing.T) {
+	c, err := parseServeConfig(nil, envFunc(fullServeEnv()), io.Discard)
+	if err != nil || c.MaxPreAuth != defaultMaxPreAuth {
+		t.Fatalf("default = %d, %v; want %d", c.MaxPreAuth, err, defaultMaxPreAuth)
+	}
+	env := withEnv(fullServeEnv(), envMaxPreAuth, "10")
+	c, err = parseServeConfig(nil, envFunc(env), io.Discard)
+	if err != nil || c.MaxPreAuth != 10 {
+		t.Fatalf("env = %d, %v; want 10", c.MaxPreAuth, err)
+	}
+	c, err = parseServeConfig([]string{"--max-preauth-connections", "5"}, envFunc(env), io.Discard)
+	if err != nil || c.MaxPreAuth != 5 {
+		t.Fatalf("flag = %d, %v; want 5", c.MaxPreAuth, err)
+	}
+	if _, err := parseServeConfig([]string{"--max-preauth-connections", "0"}, envFunc(fullServeEnv()), io.Discard); err == nil {
+		t.Error("zero cap accepted")
+	}
+	if _, err := parseServeConfig(nil, envFunc(withEnv(fullServeEnv(), envMaxPreAuth, "lots")), io.Discard); err == nil {
+		t.Error("bad env accepted")
+	}
+}

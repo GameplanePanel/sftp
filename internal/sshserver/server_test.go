@@ -31,6 +31,8 @@ type fakeAPI struct {
 	loginErr error
 	logins   []apiclient.LoginRequest
 	revoke   func(tokens []string) []string
+	ended    []string
+	endErr   error
 	seq      int
 }
 
@@ -62,6 +64,19 @@ func (f *fakeAPI) CheckSessions(_ context.Context, tokens []string) ([]string, e
 		return nil, nil
 	}
 	return fn(tokens), nil
+}
+
+func (f *fakeAPI) EndSession(_ context.Context, token string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ended = append(f.ended, token)
+	return f.endErr
+}
+
+func (f *fakeAPI) endedTokens() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ended...)
 }
 
 func (f *fakeAPI) setRevoke(fn func([]string) []string) {
@@ -607,5 +622,156 @@ func TestLoadHostKeysErrors(t *testing.T) {
 	}
 	if _, err := LoadHostKeys(junk); err == nil {
 		t.Error("unparseable key accepted")
+	}
+}
+
+// rawBanner dials the server without speaking SSH and reads its version
+// banner, which proves the server accepted the connection into handle.
+func rawBanner(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	raw, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	if err := raw.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	buf := make([]byte, len(serverVersion))
+	if _, err := io.ReadFull(raw, buf); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	return raw
+}
+
+func TestPreAuthCapClosesExtraConnections(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.MaxPreAuthConnections = 1 }, &fakeAPI{})
+	first := rawBanner(t, h.addr)
+
+	// The cap is full, so the next connection is closed without a banner.
+	second, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", h.addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = second.Close() }()
+	if err := second.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	if n, err := second.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("over-cap connection read %d bytes, err %v; want it closed", n, err)
+	}
+	if got := testutil.ToFloat64(h.metrics.preAuth); got != 1 {
+		t.Fatalf("preauth rejected = %v, want 1", got)
+	}
+
+	// Freeing the slot admits a normal login again.
+	_ = first.Close()
+	eventually(t, "the pre-auth slot to be freed", func() bool {
+		c, err := h.dialErr("alice", ssh.Password("pw"))
+		if err != nil {
+			return false
+		}
+		_ = c.Close()
+		return true
+	})
+}
+
+func TestPreAuthSlotIsFreedAfterLogin(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.MaxPreAuthConnections = 1 }, &fakeAPI{})
+	a := h.mustDial("alice", ssh.Password("pw"))
+	if err := readRoot(a); err != nil {
+		t.Fatalf("alice: %v", err)
+	}
+	// alice is authenticated and holds no pre-auth slot, so bob fits.
+	b := h.mustDial("bob", ssh.Password("pw"))
+	if err := readRoot(b); err != nil {
+		t.Fatalf("bob: %v", err)
+	}
+	if got := testutil.ToFloat64(h.metrics.preAuth); got != 0 {
+		t.Fatalf("preauth rejected = %v, want 0", got)
+	}
+}
+
+func TestExtraSessionChannelsAreRejected(t *testing.T) {
+	h := newHarness(t, nil, &fakeAPI{})
+	c := h.mustDial("alice", ssh.Password("pw"))
+	first, _, err := c.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatalf("first session channel: %v", err)
+	}
+	_, _, err = c.OpenChannel("session", nil)
+	var oce *ssh.OpenChannelError
+	if !errors.As(err, &oce) || oce.Reason != ssh.ResourceShortage {
+		t.Fatalf("second session channel: err = %v, want ResourceShortage", err)
+	}
+	// Once the first channel is gone, a new one is allowed again.
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first: %v", err)
+	}
+	eventually(t, "the session slot to be freed", func() bool {
+		ch, _, err := c.OpenChannel("session", nil)
+		if err != nil {
+			return false
+		}
+		_ = ch.Close()
+		return true
+	})
+}
+
+func TestPasswordLoginOverCapEndsAPISession(t *testing.T) {
+	api := &fakeAPI{}
+	h := newHarness(t, func(c *Config) { c.MaxSessionsPerUser = 1 }, api)
+	a := h.mustDial("alice", ssh.Password("pw"))
+	if err := readRoot(a); err != nil {
+		t.Fatalf("alice 1: %v", err)
+	}
+	if _, err := h.dialErr("alice", ssh.Password("pw")); err == nil {
+		t.Fatal("second connection for alice was accepted")
+	}
+	// The first login created gpsftp_test_1; the refused one gpsftp_test_2.
+	got := api.endedTokens()
+	if len(got) != 1 || got[0] != "gpsftp_test_2" {
+		t.Fatalf("ended sessions = %v, want [gpsftp_test_2]", got)
+	}
+}
+
+func TestKeyLoginOverCapEndsAPISession(t *testing.T) {
+	api := &fakeAPI{}
+	h := newHarness(t, func(c *Config) { c.MaxSessionsPerUser = 1 }, api)
+	a := h.mustDial("alice", ssh.PublicKeys(newEd25519Signer(t)))
+	if err := readRoot(a); err != nil {
+		t.Fatalf("alice 1: %v", err)
+	}
+	// Key auth finishes in the SSH layer, so the dial may succeed; the server
+	// then drops the connection.
+	if c, err := h.dialErr("alice", ssh.PublicKeys(newEd25519Signer(t))); err == nil {
+		defer func() { _ = c.Close() }()
+		waitClosed(t, c)
+	}
+	eventually(t, "the refused API session to be ended", func() bool {
+		got := api.endedTokens()
+		return len(got) == 1 && got[0] == "gpsftp_test_2"
+	})
+}
+
+func TestEndSessionFailureIsTolerated(t *testing.T) {
+	api := &fakeAPI{endErr: errors.New("api down")}
+	h := newHarness(t, func(c *Config) { c.MaxSessionsPerUser = 1 }, api)
+	a := h.mustDial("alice", ssh.Password("pw"))
+	if err := readRoot(a); err != nil {
+		t.Fatalf("alice 1: %v", err)
+	}
+	if _, err := h.dialErr("alice", ssh.Password("pw")); err == nil {
+		t.Fatal("second connection for alice was accepted")
+	}
+	if got := api.endedTokens(); len(got) != 1 {
+		t.Fatalf("ended sessions = %v, want one attempt", got)
+	}
+}
+
+func TestNewRejectsNegativePreAuthCap(t *testing.T) {
+	_, err := New(Config{HostKeys: []ssh.Signer{newEd25519Signer(t)}, MaxPreAuthConnections: -1}, &fakeAPI{}, testHandlers)
+	if err == nil {
+		t.Fatal("negative pre-auth cap accepted")
 	}
 }

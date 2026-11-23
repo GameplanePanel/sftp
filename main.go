@@ -41,6 +41,7 @@ const (
 	defaultIdleTimeout         = 15 * time.Minute
 	defaultMaxSessionsPerUser  = 4
 	defaultMaxTransfersPerUser = 8
+	defaultMaxPreAuth          = 64
 
 	envListen              = "GAMEPLANE_SFTP_LISTEN"
 	envHostKey             = "GAMEPLANE_SFTP_HOST_KEY"
@@ -50,6 +51,7 @@ const (
 	envIdleTimeout         = "GAMEPLANE_SFTP_IDLE_TIMEOUT"
 	envMaxSessionsPerUser  = "GAMEPLANE_SFTP_MAX_SESSIONS_PER_USER"
 	envMaxTransfersPerUser = "GAMEPLANE_SFTP_MAX_TRANSFERS_PER_USER"
+	envMaxPreAuth          = "GAMEPLANE_SFTP_MAX_PREAUTH_CONNECTIONS"
 	envMetricsAddr         = "GAMEPLANE_SFTP_METRICS_ADDR"
 	envDefaultNamespace    = "GAMEPLANE_SFTP_DEFAULT_NAMESPACE"
 
@@ -101,7 +103,9 @@ type serveConfig struct {
 	// MaxTransfersPerUser is handed to the virtual file system's per-user
 	// transfer limiter.
 	MaxTransfersPerUser int
-	MetricsAddr         string
+	// MaxPreAuth caps concurrent connections still before authentication.
+	MaxPreAuth  int
+	MetricsAddr string
 	// DefaultNamespace is the namespace shown as /<server> at the top of a
 	// tree login. It must match the API's default games namespace.
 	DefaultNamespace string
@@ -123,6 +127,11 @@ func parseServeConfig(args []string, getenv func(string) string, errOut io.Write
 		return serveConfig{}, err
 	}
 
+	maxPreAuth, err := envInt(getenv, envMaxPreAuth, defaultMaxPreAuth)
+	if err != nil {
+		return serveConfig{}, err
+	}
+
 	var c serveConfig
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(errOut)
@@ -134,6 +143,7 @@ func parseServeConfig(args []string, getenv func(string) string, errOut io.Write
 	fs.DurationVar(&c.IdleTimeout, "idle-timeout", idle, "close a connection with no traffic for this long")
 	fs.IntVar(&c.MaxSessionsPerUser, "max-sessions-per-user", maxSessions, "concurrent SSH connections allowed per user")
 	fs.IntVar(&c.MaxTransfersPerUser, "max-transfers-per-user", maxTransfers, "concurrent file transfers allowed per user")
+	fs.IntVar(&c.MaxPreAuth, "max-preauth-connections", maxPreAuth, "concurrent connections allowed before authentication finishes; more are closed at once")
 	fs.StringVar(&c.MetricsAddr, "metrics-addr", envString(getenv, envMetricsAddr, defaultMetricsAddr), "address for /metrics; empty disables it")
 	fs.StringVar(&c.DefaultNamespace, "default-namespace", envString(getenv, envDefaultNamespace, vfs.DefaultNamespace), "namespace whose servers appear as /<server>; must match the API's default games namespace")
 	if err := fs.Parse(args); err != nil {
@@ -160,6 +170,9 @@ func parseServeConfig(args []string, getenv func(string) string, errOut io.Write
 	}
 	if c.MaxTransfersPerUser < 1 {
 		return serveConfig{}, errors.New("serve: --max-transfers-per-user must be at least 1")
+	}
+	if c.MaxPreAuth < 1 {
+		return serveConfig{}, errors.New("serve: --max-preauth-connections must be at least 1")
 	}
 	return c, nil
 }
@@ -231,12 +244,13 @@ func runServe(args []string, getenv func(string) string, errOut io.Writer) error
 		}).Handlers()
 	}
 	srv, err := sshserver.New(sshserver.Config{
-		Addr:               cfg.Listen,
-		HostKeys:           hostKeys,
-		IdleTimeout:        cfg.IdleTimeout,
-		MaxSessionsPerUser: cfg.MaxSessionsPerUser,
-		Logger:             logger,
-		Metrics:            metrics,
+		Addr:                  cfg.Listen,
+		HostKeys:              hostKeys,
+		IdleTimeout:           cfg.IdleTimeout,
+		MaxSessionsPerUser:    cfg.MaxSessionsPerUser,
+		MaxPreAuthConnections: cfg.MaxPreAuth,
+		Logger:                logger,
+		Metrics:               metrics,
 	}, api, factory)
 	if err != nil {
 		return err

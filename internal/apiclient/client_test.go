@@ -703,3 +703,38 @@ func TestTrimMessage(t *testing.T) {
 		t.Errorf("invalid UTF-8 not stripped: %q", got)
 	}
 }
+
+func TestEndSessionSendsToken(t *testing.T) {
+	var got struct {
+		SessionTokens []string `json:"sessionTokens"`
+	}
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/sftp/v1/sessions/end" {
+			t.Errorf("got %s %s", r.Method, r.URL.Path)
+		}
+		assertBearer(t, r, testServiceToken)
+		assertCommon(t, r)
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	if err := c.EndSession(context.Background(), "gpsftp_x"); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	if len(got.SessionTokens) != 1 || got.SessionTokens[0] != "gpsftp_x" {
+		t.Fatalf("body tokens = %v", got.SessionTokens)
+	}
+}
+
+func TestEndSessionErrors(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	if err := c.EndSession(context.Background(), "gpsftp_x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("404: err = %v, want ErrNotFound", err)
+	}
+	if err := c.EndSession(context.Background(), ""); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("empty token: err = %v, want ErrBadRequest", err)
+	}
+}

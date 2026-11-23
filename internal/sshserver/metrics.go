@@ -20,6 +20,7 @@ type Metrics struct {
 	sessions prometheus.Gauge
 	logins   *prometheus.CounterVec
 	revokes  prometheus.Counter
+	preAuth  prometheus.Counter
 	bytes    *prometheus.CounterVec
 }
 
@@ -39,12 +40,16 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 			Name: "gameplane_sftp_revoked_total",
 			Help: "Connections closed because their session was revoked.",
 		}),
+		preAuth: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "gameplane_sftp_preauth_rejected_total",
+			Help: "Connections closed at once because too many were still authenticating.",
+		}),
 		bytes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gameplane_sftp_bytes_total",
 			Help: "File bytes transferred, by direction (read or write).",
 		}, []string{"direction"}),
 	}
-	for _, c := range []prometheus.Collector{m.sessions, m.logins, m.revokes, m.bytes} {
+	for _, c := range []prometheus.Collector{m.sessions, m.logins, m.revokes, m.preAuth, m.bytes} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("register sftp metrics: %w", err)
 		}
@@ -95,4 +100,11 @@ func (m *Metrics) revoked() {
 		return
 	}
 	m.revokes.Inc()
+}
+
+func (m *Metrics) preAuthRejected() {
+	if m == nil {
+		return
+	}
+	m.preAuth.Inc()
 }

@@ -312,6 +312,22 @@ func (c *Client) CheckSessions(ctx context.Context, tokens []string) ([]string, 
 	return revoked, nil
 }
 
+// EndSession asks the API to close one session, identified by its token. The
+// server calls it for a login it created but will not use, so the session does
+// not stay open until it expires. It uses the service token.
+func (c *Client) EndSession(ctx context.Context, token string) error {
+	if token == "" {
+		return &Error{Op: "sessions end", Msg: "no session token", Err: ErrBadRequest}
+	}
+	if c.serviceToken == "" {
+		return &Error{Op: "sessions end", Msg: "service token not configured", Err: ErrUnauthorized}
+	}
+	in := struct {
+		SessionTokens []string `json:"sessionTokens"`
+	}{SessionTokens: []string{token}}
+	return c.exec(ctx, "sessions end", http.MethodPost, "/sftp/v1/sessions/end", c.serviceToken, nil, in)
+}
+
 // ServerRef is one server a session may reach.
 type ServerRef struct {
 	Namespace string `json:"namespace"`

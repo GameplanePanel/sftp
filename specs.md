@@ -42,6 +42,7 @@ Optional SFTP endpoint, one per cluster, that gives users SFTP access to the fil
 | `--ca-file` | `GAMEPLANE_SFTP_CA_FILE` | none | extra PEM CA bundle for the API, added to the system roots |
 | `--idle-timeout` | `GAMEPLANE_SFTP_IDLE_TIMEOUT` | `15m` | close a connection with no traffic for this long |
 | `--max-sessions-per-user` | `GAMEPLANE_SFTP_MAX_SESSIONS_PER_USER` | `4` | concurrent SSH connections per user |
+| `--max-preauth-connections` | `GAMEPLANE_SFTP_MAX_PREAUTH_CONNECTIONS` | `64` | concurrent connections still before authentication; further ones are closed at once |
 | `--max-transfers-per-user` | `GAMEPLANE_SFTP_MAX_TRANSFERS_PER_USER` | `8` | concurrent file transfers per user, across connections |
 | `--default-namespace` | `GAMEPLANE_SFTP_DEFAULT_NAMESPACE` | `gameplane-games` | namespace shown as `/<server>`; must equal the API's default games namespace |
 | `--metrics-addr` | `GAMEPLANE_SFTP_METRICS_ADDR` | `:9102` | address for `/metrics`; empty disables it |
@@ -68,12 +69,14 @@ Exit code 2 with a message on stderr for a usage or startup error.
 
 ### Metrics
 
-On `--metrics-addr` at `/metrics` (private registry): `gameplane_sftp_sessions` (gauge), `gameplane_sftp_logins_total{result="ok|denied|error|limit"}`, `gameplane_sftp_revoked_total`, `gameplane_sftp_bytes_total{direction="read|write"}`.
+On `--metrics-addr` at `/metrics` (private registry): `gameplane_sftp_sessions` (gauge), `gameplane_sftp_logins_total{result="ok|denied|error|limit"}`, `gameplane_sftp_revoked_total`, `gameplane_sftp_preauth_rejected_total` (connections closed at once because the pre-auth cap was reached), `gameplane_sftp_bytes_total{direction="read|write"}`.
 
 ## Key invariants
 
-- Only session channels with the `sftp` subsystem are served. `shell`, `exec`, `pty-req`, `env`, `x11-req`, agent forwarding and every other request are refused; `direct-tcpip` and other channel types are rejected; global forwarding requests are discarded. Only one SFTP subsystem runs per connection.
+- Only session channels with the `sftp` subsystem are served. `shell`, `exec`, `pty-req`, `env`, `x11-req`, agent forwarding and every other request are refused; `direct-tcpip` and other channel types are rejected; global forwarding requests are discarded. Only one SFTP subsystem runs per connection, and only one session channel is open at a time: a second concurrent session channel is rejected with `ResourceShortage`. A non-`sftp` subsystem, `shell` and `exec` are refused.
 - Every authenticated connection is registered by session token. Every 30 seconds the server sends the tokens to `POST /sftp/v1/sessions/check` and closes the connections whose tokens are reported revoked. A failed check keeps the connections (it never fails open into a kill, nor a grant).
+- At most `--max-preauth-connections` connections may be before authentication at once (the slot is freed when the handshake and the API login finish). A connection over the cap is closed immediately, before any SSH exchange, and counted in `gameplane_sftp_preauth_rejected_total`.
+- An API session the server creates but does not use is ended with `POST /sftp/v1/sessions/end` (service token, body `{"sessionTokens": ["gpsftp_…"]}`): a login refused by the per-user cap (password or key), and a password login whose SSH handshake does not finish. A failed end call is only logged; the session still expires on its own.
 - Per-user caps are keyed by the lowercased API user name and enforced after authentication.
 - The session token is used only as the bearer for the API calls of its own connection and is never logged. Passwords and keys are never logged.
 - Before authentication completes, each read or write has a 10 s deadline, and `MaxAuthTries` is 3.
@@ -88,7 +91,7 @@ On `--metrics-addr` at `/metrics` (private registry): `gameplane_sftp_sessions` 
 - The service token authorises only login and session checks; file operations use the user's own short-lived session token, which the API restricts to the SFTP routes.
 - Host keys must be stable across restarts (mounted from a Secret); they are read through `os.Root`, so a path cannot escape its directory.
 - The API URL should be `https`; use `--ca-file` for a private CA.
-- A session refused after the SSH handshake (key logins, the per-user cap) can leave an unused API session that expires on its own.
+- The session-end route `POST /sftp/v1/sessions/end` is not yet in the Gameplane API contract (`specs/040-sftp-access/contracts/api.md`). Until the API implements it, the call fails (logged at debug level) and an unused session expires on its own.
 
 ## Testing & coverage
 
