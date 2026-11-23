@@ -238,7 +238,31 @@ func (f *FS) resolveWrite(ctx context.Context, p string) (location, error) {
 	if !loc.writable() {
 		return location{}, sftp.ErrSSHFxPermissionDenied
 	}
+	readOnly, err := f.serverReadOnly(ctx, loc.namespace, loc.server)
+	if err != nil {
+		return location{}, f.fail("servers", err)
+	}
+	if readOnly {
+		// Refuse now, so an upload fails when the file is opened rather than
+		// when it is closed. The API still checks every change itself.
+		return location{}, sftp.ErrSSHFxPermissionDenied
+	}
 	return loc, nil
+}
+
+// serverReadOnly reports whether the inventory marks the server read-only for
+// this session. A server missing from the inventory is left to the API.
+func (f *FS) serverReadOnly(ctx context.Context, ns, server string) (bool, error) {
+	list, err := f.inventory(ctx, false)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range list {
+		if s.Namespace == ns && s.Server == server {
+			return s.ReadOnly(), nil
+		}
+	}
+	return false, nil
 }
 
 // inventory returns the servers the session may reach. It is cached for
