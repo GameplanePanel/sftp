@@ -545,7 +545,7 @@ func (c *deadlineConn) Read(p []byte) (int, error) {
 
 func (c *deadlineConn) Write(p []byte) (int, error) {
 	c.touch()
-	return c.Write(p)
+	return c.Conn.Write(p)
 }
 
 func (c *deadlineConn) touch() {
