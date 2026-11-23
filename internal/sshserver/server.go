@@ -333,7 +333,6 @@ type connState struct {
 	user        string // API user name as returned by login
 	key         string // lowercased user, the per-user cap key
 	sftpStarted atomic.Bool
-	sessionOpen atomic.Bool // a session channel is currently accepted
 	revoked     atomic.Bool
 }
 
@@ -397,15 +396,9 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, releasePreAuth func()
 			_ = nc.Reject(ssh.UnknownChannelType, "only session channels")
 			continue
 		}
-		// One session channel at a time: a second one would only sit idle.
-		if !st.sessionOpen.CompareAndSwap(false, true) {
-			_ = nc.Reject(ssh.ResourceShortage, "one session channel per connection")
-			continue
-		}
 		channels.Add(1)
 		go func() {
 			defer channels.Done()
-			defer st.sessionOpen.Store(false)
 			s.serveSession(nc, st)
 		}()
 	}
@@ -535,13 +528,24 @@ func (s *Server) serveSession(nc ssh.NewChannel, st *connState) {
 		return
 	}
 	var sftpDone sync.WaitGroup
+	// mine is set once this channel runs the connection's sftp subsystem.
+	// While another channel runs it, this one is an extra: every request is
+	// refused and the channel is closed right after, so it never sits idle.
+	mine := false
+	refuse := func(req *ssh.Request) {
+		_ = req.Reply(false, nil)
+		if !mine && st.sftpStarted.Load() {
+			_ = ch.Close()
+		}
+	}
 	for req := range reqs {
 		switch req.Type {
 		case "subsystem":
 			if name, ok := subsystemName(req.Payload); !ok || name != sftpSubsystem || !st.sftpStarted.CompareAndSwap(false, true) {
-				_ = req.Reply(false, nil)
+				refuse(req)
 				continue
 			}
+			mine = true
 			_ = req.Reply(true, nil)
 			sftpDone.Add(1)
 			go func() {
@@ -554,7 +558,7 @@ func (s *Server) serveSession(nc ssh.NewChannel, st *connState) {
 		default:
 			// pty-req, env, x11-req, window-change, signal, auth-agent-req
 			// and anything unknown: refused.
-			_ = req.Reply(false, nil)
+			refuse(req)
 		}
 	}
 	sftpDone.Wait()

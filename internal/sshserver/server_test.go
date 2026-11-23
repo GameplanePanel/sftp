@@ -692,30 +692,39 @@ func TestPreAuthSlotIsFreedAfterLogin(t *testing.T) {
 	}
 }
 
-func TestExtraSessionChannelsAreRejected(t *testing.T) {
+func TestExtraSessionChannelIsClosedAfterRefusal(t *testing.T) {
 	h := newHarness(t, nil, &fakeAPI{})
 	c := h.mustDial("alice", ssh.Password("pw"))
-	first, _, err := c.OpenChannel("session", nil)
+	sc, err := sftp.NewClient(c)
 	if err != nil {
-		t.Fatalf("first session channel: %v", err)
+		t.Fatalf("first sftp: %v", err)
 	}
-	_, _, err = c.OpenChannel("session", nil)
-	var oce *ssh.OpenChannelError
-	if !errors.As(err, &oce) || oce.Reason != ssh.ResourceShortage {
-		t.Fatalf("second session channel: err = %v, want ResourceShortage", err)
+	defer func() { _ = sc.Close() }()
+
+	// The extra channel is accepted, its requests are refused, and the
+	// server then closes it instead of leaving it idle.
+	s, err := c.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
 	}
-	// Once the first channel is gone, a new one is allowed again.
-	if err := first.Close(); err != nil {
-		t.Fatalf("close first: %v", err)
+	defer func() { _ = s.Close() }()
+	if err := s.RequestSubsystem("sftp"); err == nil {
+		t.Fatal("second sftp subsystem was accepted")
 	}
-	eventually(t, "the session slot to be freed", func() bool {
-		ch, _, err := c.OpenChannel("session", nil)
-		if err != nil {
-			return false
-		}
-		_ = ch.Close()
-		return true
-	})
+	done := make(chan struct{})
+	go func() {
+		_ = s.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("extra session channel was not closed")
+	}
+	// The sftp channel is unaffected.
+	if _, err := sc.ReadDir("/"); err != nil {
+		t.Fatalf("first sftp after extra channel: %v", err)
+	}
 }
 
 func TestPasswordLoginOverCapEndsAPISession(t *testing.T) {
