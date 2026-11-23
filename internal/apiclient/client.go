@@ -332,7 +332,14 @@ func (c *Client) EndSession(ctx context.Context, token string) error {
 type ServerRef struct {
 	Namespace string `json:"namespace"`
 	Server    string `json:"server"`
+	// Write is the API's write decision for this server. Nil (an API that
+	// does not send it) leaves the decision to the API at commit time.
+	Write *bool `json:"write,omitempty"`
 }
+
+// ReadOnly reports whether the API said the session may not change files on
+// this server.
+func (s ServerRef) ReadOnly() bool { return s.Write != nil && !*s.Write }
 
 // Servers lists the servers the session may reach.
 func (c *Client) Servers(ctx context.Context, sessionToken string) ([]ServerRef, error) {

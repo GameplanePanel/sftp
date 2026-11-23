@@ -59,7 +59,8 @@ Exit code 2 with a message on stderr for a usage or startup error.
 ### File tree
 
 - Tree login: `/<server>/...` for servers in the default namespace; `/_namespaces/<ns>/<server>/...` for others. The root, `/_namespaces`, `/_namespaces/<ns>` and each server's top folder are read-only virtual directories (create, rename, remove and write are refused). Kubernetes names cannot start with `_`, so `_namespaces` never collides with a server.
-- Target login: `/` is the server's root, read-only itself; the server list is never fetched.
+- Target login: `/` is the server's root, read-only itself; the server list is fetched only to check write access before a change.
+- Write access: `GET /sftp/v1/servers` marks each server with `write`, the API's file-access decision. On a server marked `write: false`, open-for-write, mkdir, rename and remove are refused with permission denied before any request reaches the file routes, so an upload fails when the file is opened. A server without the field is left to the API, which checks every change itself.
 - Paths are cleaned before use, so `..` cannot leave a server and no path can reach another server. A rename between servers is refused.
 - Dotfiles: any path component starting with `.` is not found for reads and stat, refused for writes, and filtered from listings.
 - Reads stream with `Range` requests. Reads a little ahead of the stream skip forward and keep the skipped bytes, because `pkg/sftp` may deliver pipelined reads slightly out of order; a far seek reopens the download.
