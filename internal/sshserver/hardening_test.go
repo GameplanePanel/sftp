@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -136,12 +137,20 @@ func TestConfirmedSessionOutlivesRevalidateWindow(t *testing.T) {
 func TestExpiredSessionAtLoginIsRefused(t *testing.T) {
 	api := &fakeAPI{expiresIn: -time.Hour}
 	h := newHarness(t, nil, api)
-	c, err := h.dialErr("alice", ssh.Password("pw"))
-	if err == nil {
+	// Authentication itself succeeds at the API; the server refuses the
+	// expired session right after the handshake, so no SFTP is ever served.
+	if c, err := h.dialErr("alice", ssh.Password("pw")); err == nil {
 		defer func() { _ = c.Close() }()
 		if err := readRoot(c); err == nil {
 			t.Fatal("expired session served SFTP")
 		}
+	}
+	// Either way the server ends the unused API session.
+	eventually(t, "the expired session to be ended at the API", func() bool {
+		return slices.Contains(api.endedTokens(), "gpsftp_test_1")
+	})
+	if got := testutil.ToFloat64(h.metrics.sessions); got != 0 {
+		t.Fatalf("session gauge = %v, want 0", got)
 	}
 }
 
