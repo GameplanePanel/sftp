@@ -36,27 +36,34 @@ var errUsage = errors.New("usage: sftp serve [flags] | sftp version")
 // Defaults and environment variable names for the serve subcommand. A flag
 // overrides its variable, and the variable overrides the default.
 const (
-	defaultListen              = ":2222"
-	defaultMetricsAddr         = ":9102"
+	defaultListen = ":2222"
+	// The metrics listener is loopback-only by default: it has no
+	// authentication, so exposing it is an explicit choice (the chart binds
+	// it to the pod address only when a scrape is configured).
+	defaultMetricsAddr         = "127.0.0.1:9102"
 	defaultIdleTimeout         = 15 * time.Minute
 	defaultMaxSessionsPerUser  = 4
 	defaultMaxTransfersPerUser = 8
 	defaultMaxPreAuth          = 64
+	defaultMaxPreAuthPerIP     = 8
 
 	envListen              = "GAMEPLANE_SFTP_LISTEN"
 	envHostKey             = "GAMEPLANE_SFTP_HOST_KEY"
 	envAPIURL              = "GAMEPLANE_SFTP_API_URL"
 	envSvcAuthFile         = "GAMEPLANE_SFTP_SERVICE_TOKEN_FILE"
 	envCAFile              = "GAMEPLANE_SFTP_CA_FILE"
+	envAllowInsecureAPI    = "GAMEPLANE_SFTP_ALLOW_INSECURE_API"
 	envIdleTimeout         = "GAMEPLANE_SFTP_IDLE_TIMEOUT"
 	envMaxSessionsPerUser  = "GAMEPLANE_SFTP_MAX_SESSIONS_PER_USER"
 	envMaxTransfersPerUser = "GAMEPLANE_SFTP_MAX_TRANSFERS_PER_USER"
 	envMaxPreAuth          = "GAMEPLANE_SFTP_MAX_PREAUTH_CONNECTIONS"
+	envMaxPreAuthPerIP     = "GAMEPLANE_SFTP_MAX_PREAUTH_PER_IP"
 	envMetricsAddr         = "GAMEPLANE_SFTP_METRICS_ADDR"
 	envDefaultNamespace    = "GAMEPLANE_SFTP_DEFAULT_NAMESPACE"
 
 	metricsShutdownTimeout = 5 * time.Second
 	metricsReadHeaderLimit = 10 * time.Second
+	metricsIOLimit         = 30 * time.Second
 )
 
 func main() {
@@ -93,19 +100,23 @@ func run(args []string, out io.Writer) error {
 
 // serveConfig is the parsed serve subcommand.
 type serveConfig struct {
-	Listen             string
-	HostKeyPath        string
-	APIURL             string
-	ServiceTokenFile   string
-	CAFile             string
+	Listen           string
+	HostKeyPath      string
+	APIURL           string
+	ServiceTokenFile string
+	CAFile           string
+	// AllowInsecureAPI accepts an http:// API URL. Off by default.
+	AllowInsecureAPI   bool
 	IdleTimeout        time.Duration
 	MaxSessionsPerUser int
 	// MaxTransfersPerUser is handed to the virtual file system's per-user
 	// transfer limiter.
 	MaxTransfersPerUser int
 	// MaxPreAuth caps concurrent connections still before authentication.
-	MaxPreAuth  int
-	MetricsAddr string
+	MaxPreAuth int
+	// MaxPreAuthPerIP caps those connections per source IP.
+	MaxPreAuthPerIP int
+	MetricsAddr     string
 	// DefaultNamespace is the namespace shown as /<server> at the top of a
 	// tree login. It must match the API's default games namespace.
 	DefaultNamespace string
@@ -132,6 +143,15 @@ func parseServeConfig(args []string, getenv func(string) string, errOut io.Write
 		return serveConfig{}, err
 	}
 
+	maxPreAuthIP, err := envInt(getenv, envMaxPreAuthPerIP, defaultMaxPreAuthPerIP)
+	if err != nil {
+		return serveConfig{}, err
+	}
+	allowInsecure, err := envBool(getenv, envAllowInsecureAPI)
+	if err != nil {
+		return serveConfig{}, err
+	}
+
 	var c serveConfig
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(errOut)
@@ -140,10 +160,12 @@ func parseServeConfig(args []string, getenv func(string) string, errOut io.Write
 	fs.StringVar(&c.APIURL, "api-url", getenv(envAPIURL), "Gameplane API base URL, for example https://gameplane-api.gameplane.svc:8080 (required)")
 	fs.StringVar(&c.ServiceTokenFile, "service-token-file", getenv(envSvcAuthFile), "file holding the service token (required)")
 	fs.StringVar(&c.CAFile, "ca-file", getenv(envCAFile), "optional PEM bundle of extra CA certificates for the API")
+	fs.BoolVar(&c.AllowInsecureAPI, "allow-insecure-api", allowInsecure, "accept an http:// API URL; credentials then cross the network unencrypted (only for a hop inside one cluster's pod network)")
 	fs.DurationVar(&c.IdleTimeout, "idle-timeout", idle, "close a connection with no traffic for this long")
 	fs.IntVar(&c.MaxSessionsPerUser, "max-sessions-per-user", maxSessions, "concurrent SSH connections allowed per user")
 	fs.IntVar(&c.MaxTransfersPerUser, "max-transfers-per-user", maxTransfers, "concurrent file transfers allowed per user")
 	fs.IntVar(&c.MaxPreAuth, "max-preauth-connections", maxPreAuth, "concurrent connections allowed before authentication finishes; more are closed at once")
+	fs.IntVar(&c.MaxPreAuthPerIP, "max-preauth-per-ip", maxPreAuthIP, "concurrent connections allowed per source IP before authentication finishes; more are closed at once")
 	fs.StringVar(&c.MetricsAddr, "metrics-addr", envString(getenv, envMetricsAddr, defaultMetricsAddr), "address for /metrics; empty disables it")
 	fs.StringVar(&c.DefaultNamespace, "default-namespace", envString(getenv, envDefaultNamespace, vfs.DefaultNamespace), "namespace whose servers appear as /<server>; must match the API's default games namespace")
 	if err := fs.Parse(args); err != nil {
@@ -174,6 +196,9 @@ func parseServeConfig(args []string, getenv func(string) string, errOut io.Write
 	if c.MaxPreAuth < 1 {
 		return serveConfig{}, errors.New("serve: --max-preauth-connections must be at least 1")
 	}
+	if c.MaxPreAuthPerIP < 1 {
+		return serveConfig{}, errors.New("serve: --max-preauth-per-ip must be at least 1")
+	}
 	return c, nil
 }
 
@@ -182,6 +207,18 @@ func envString(getenv func(string) string, key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envBool(getenv func(string) string, key string) (bool, error) {
+	v := getenv(key)
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", key, err)
+	}
+	return b, nil
 }
 
 func envDuration(getenv func(string) string, key string, def time.Duration) (time.Duration, error) {
@@ -224,7 +261,7 @@ func runServe(args []string, getenv func(string) string, errOut io.Writer) error
 	if err != nil {
 		return err
 	}
-	api, err := apiclient.New(apiclient.Config{BaseURL: cfg.APIURL, ServiceToken: token, CAFile: cfg.CAFile})
+	api, err := apiclient.New(apiclient.Config{BaseURL: cfg.APIURL, ServiceToken: token, CAFile: cfg.CAFile, AllowInsecureHTTP: cfg.AllowInsecureAPI})
 	if err != nil {
 		return fmt.Errorf("api client: %w", err)
 	}
@@ -235,20 +272,25 @@ func runServe(args []string, getenv func(string) string, errOut io.Writer) error
 		return err
 	}
 	limiter := vfs.NewLimiter(cfg.MaxTransfersPerUser)
+	// srv is set right below, before Serve starts any connection, so the
+	// handlers never see it nil.
+	var srv *sshserver.Server
 	factory := func(sess apiclient.Session, _ string) sftp.Handlers {
 		return vfs.New(api, sess, vfs.Options{
 			DefaultNamespace: cfg.DefaultNamespace,
 			Limiter:          limiter,
 			OnBytes:          metrics.AddBytes,
 			Logger:           logger,
+			OnUnauthorized:   func() { srv.Revoke(sess.Token) },
 		}).Handlers()
 	}
-	srv, err := sshserver.New(sshserver.Config{
+	srv, err = sshserver.New(sshserver.Config{
 		Addr:                  cfg.Listen,
 		HostKeys:              hostKeys,
 		IdleTimeout:           cfg.IdleTimeout,
 		MaxSessionsPerUser:    cfg.MaxSessionsPerUser,
 		MaxPreAuthConnections: cfg.MaxPreAuth,
+		MaxPreAuthPerIP:       cfg.MaxPreAuthPerIP,
 		Logger:                logger,
 		Metrics:               metrics,
 	}, api, factory)
@@ -265,10 +307,15 @@ func runServe(args []string, getenv func(string) string, errOut io.Writer) error
 
 	var metricsSrv *http.Server
 	if cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 		metricsSrv = &http.Server{
 			Addr:              cfg.MetricsAddr,
-			Handler:           promhttp.HandlerFor(reg, promhttp.HandlerOpts{}),
+			Handler:           mux,
 			ReadHeaderTimeout: metricsReadHeaderLimit,
+			ReadTimeout:       metricsIOLimit,
+			WriteTimeout:      metricsIOLimit,
+			IdleTimeout:       metricsIOLimit,
 		}
 		go func() {
 			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

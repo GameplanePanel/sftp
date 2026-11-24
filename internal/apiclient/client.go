@@ -86,8 +86,14 @@ func (e *Error) Unwrap() error { return e.Err }
 // Config configures a Client.
 type Config struct {
 	// BaseURL is the API origin, for example https://gameplane-api.gameplane.svc:8080.
-	// A trailing slash is trimmed. Only http and https are accepted.
+	// A trailing slash is trimmed. It must use https unless AllowInsecureHTTP
+	// is set.
 	BaseURL string
+	// AllowInsecureHTTP lets New accept an http:// BaseURL. The service token,
+	// passwords and session tokens then cross the network in clear text, so
+	// set it only when the hop never leaves a trusted network, such as the
+	// pod network between the SFTP pod and the API Service of one cluster.
+	AllowInsecureHTTP bool
 	// ServiceToken is the contents of the service token file, trimmed. It is
 	// used only for Login and CheckSessions.
 	ServiceToken string
@@ -109,12 +115,18 @@ type Client struct {
 	streamHC     *http.Client // no overall timeout; context only
 }
 
-// New builds a Client with a TLS 1.2+ transport. CAFile, when set, must hold
-// at least one PEM certificate.
+// New builds a Client with a TLS 1.2+ transport that verifies the API's
+// certificate. BaseURL must be https unless AllowInsecureHTTP is set. CAFile,
+// when set, must hold at least one PEM certificate. Redirects are never
+// followed: a redirected request fails, so credentials are never re-sent to
+// another URL.
 func New(cfg Config) (*Client, error) {
 	base, err := validateBaseURL(cfg.BaseURL)
 	if err != nil {
 		return nil, err
+	}
+	if strings.HasPrefix(base, "http://") && !cfg.AllowInsecureHTTP {
+		return nil, errors.New("apiclient: base URL must use https (http needs AllowInsecureHTTP)")
 	}
 	pool, err := loadCAPool(cfg.CAFile)
 	if err != nil {
@@ -133,8 +145,8 @@ func New(cfg Config) (*Client, error) {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	hc := &http.Client{Transport: tr, Timeout: timeout}
-	stream := &http.Client{Transport: tr}
+	hc := &http.Client{Transport: tr, Timeout: timeout, CheckRedirect: refuseRedirect}
+	stream := &http.Client{Transport: tr, CheckRedirect: refuseRedirect}
 	return newClient(base, cfg, hc, stream), nil
 }
 
@@ -178,6 +190,13 @@ func newClient(base string, cfg Config, hc, stream *http.Client) *Client {
 		hc:           hc,
 		streamHC:     stream,
 	}
+}
+
+// refuseRedirect stops the client at the first redirect and returns the 3xx
+// response, which maps to ErrFailure. Following it would re-send the login
+// body (password or key) and the bearer token to wherever the API pointed.
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 func validateBaseURL(raw string) (string, error) {

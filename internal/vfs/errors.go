@@ -72,5 +72,8 @@ func (f *FS) fail(op string, err error) error {
 		return nil
 	}
 	f.log.Debug("sftp operation failed", "op", op, "user", f.user, "err", err.Error())
+	if f.onUnauth != nil && errors.Is(err, apiclient.ErrUnauthorized) {
+		f.onUnauth()
+	}
 	return toSFTP(err)
 }

@@ -34,6 +34,10 @@ type fakeAPI struct {
 	ended    []string
 	endErr   error
 	seq      int
+	// checkErr, when set, fails every session check.
+	checkErr error
+	// expiresIn is the session lifetime a login returns. Zero means 1h.
+	expiresIn time.Duration
 }
 
 func (f *fakeAPI) Login(_ context.Context, r apiclient.LoginRequest) (apiclient.Session, error) {
@@ -45,9 +49,13 @@ func (f *fakeAPI) Login(_ context.Context, r apiclient.LoginRequest) (apiclient.
 	}
 	f.seq++
 	user, target, hasTarget := strings.Cut(r.Username, "+")
+	expiresIn := f.expiresIn
+	if expiresIn == 0 {
+		expiresIn = time.Hour
+	}
 	sess := apiclient.Session{
 		Token:     fmt.Sprintf("gpsftp_test_%d", f.seq),
-		ExpiresAt: time.Now().Add(time.Hour).UTC().Truncate(time.Second),
+		ExpiresAt: time.Now().Add(expiresIn).UTC().Truncate(time.Second),
 		User:      user,
 	}
 	if hasTarget {
@@ -58,8 +66,11 @@ func (f *fakeAPI) Login(_ context.Context, r apiclient.LoginRequest) (apiclient.
 
 func (f *fakeAPI) CheckSessions(_ context.Context, tokens []string) ([]string, error) {
 	f.mu.Lock()
-	fn := f.revoke
+	fn, checkErr := f.revoke, f.checkErr
 	f.mu.Unlock()
+	if checkErr != nil {
+		return nil, checkErr
+	}
 	if fn == nil {
 		return nil, nil
 	}

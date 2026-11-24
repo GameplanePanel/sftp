@@ -26,12 +26,19 @@ const (
 	defaultIdleTimeout   = 15 * time.Minute
 	defaultMaxSessions   = 4
 	defaultMaxPreAuth    = 64
+	defaultMaxPreAuthIP  = 8
 	defaultCheckInterval = 30 * time.Second
 	defaultLoginTimeout  = 10 * time.Second
+	defaultRevalidate    = 2 * time.Minute
 	acceptRetryDelay     = 100 * time.Millisecond
-	serverVersion        = "SSH-2.0-Gameplane-SFTP"
-	maxAuthTries         = 3
-	sftpSubsystem        = "sftp"
+	// maxSessionChannels caps the session channels one connection may hold
+	// open at once: the SFTP channel plus one extra that is refused and
+	// closed. Further channel opens are rejected before they are accepted,
+	// so no goroutine or channel buffer is spent on them.
+	maxSessionChannels = 2
+	serverVersion      = "SSH-2.0-Gameplane-SFTP"
+	maxAuthTries       = 3
+	sftpSubsystem      = "sftp"
 
 	extSessionToken = "sessionToken"
 	extUser         = "user"
@@ -77,12 +84,22 @@ type Config struct {
 	// finished authentication. A connection over the cap is closed at once.
 	// Default 64.
 	MaxPreAuthConnections int
+	// MaxPreAuthPerIP caps the connections one source IP may have before
+	// authentication, so a single address cannot take every pre-auth slot.
+	// A connection over the cap is closed at once. Default 8.
+	MaxPreAuthPerIP int
 	// CheckInterval is how often the server asks the API which of its
 	// session tokens were revoked. Default 30s.
 	CheckInterval time.Duration
 	// LoginTimeout bounds each API call and the SSH handshake before
-	// authentication completes. Default 10s.
+	// authentication completes, and how long an accepted session channel
+	// may take to start the SFTP subsystem. Default 10s.
 	LoginTimeout time.Duration
+	// RevalidateWithin closes a connection whose session the API has not
+	// confirmed as valid for this long, for example because every session
+	// check failed. A connection is also closed once its session's known
+	// expiry passes without a confirmation. Default 2m.
+	RevalidateWithin time.Duration
 	// Logger receives operational logs. Never passwords, tokens or keys.
 	Logger *slog.Logger
 	// Metrics receives counters and gauges. Nil disables them.
@@ -98,15 +115,16 @@ type Server struct {
 	log     *slog.Logger
 	metrics *Metrics
 
-	mu       sync.Mutex
-	listener net.Listener
-	base     context.Context              // Serve's context; Background before Serve
-	open     map[net.Conn]struct{}        // every accepted connection, until it ends
-	tokens   map[string]*connState        // session token -> authenticated connection
-	perUser  map[string]int               // lowercased user -> authenticated connections
-	closing  bool                         // set once Serve's context ends
-	preAuth  int                          // connections still before authentication
-	pending  map[string]apiclient.Session // remote address -> password login awaiting handshake end
+	mu        sync.Mutex
+	listener  net.Listener
+	base      context.Context              // Serve's context; Background before Serve
+	open      map[net.Conn]struct{}        // every accepted connection, until it ends
+	tokens    map[string]*connState        // session token -> authenticated connection
+	perUser   map[string]int               // lowercased user -> authenticated connections
+	closing   bool                         // set once Serve's context ends
+	preAuth   int                          // connections still before authentication
+	preAuthIP map[string]int               // source IP -> connections still before authentication
+	pending   map[string]apiclient.Session // remote address -> password login awaiting handshake end
 }
 
 // New validates cfg and returns a Server. It does not listen.
@@ -125,16 +143,17 @@ func New(cfg Config, api API, hf HandlerFactory) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg:     cfg,
-		api:     api,
-		hf:      hf,
-		log:     cfg.Logger,
-		metrics: cfg.Metrics,
-		open:    make(map[net.Conn]struct{}),
-		tokens:  make(map[string]*connState),
-		perUser: make(map[string]int),
-		pending: make(map[string]apiclient.Session),
-		base:    context.Background(),
+		cfg:       cfg,
+		api:       api,
+		hf:        hf,
+		log:       cfg.Logger,
+		metrics:   cfg.Metrics,
+		open:      make(map[net.Conn]struct{}),
+		tokens:    make(map[string]*connState),
+		perUser:   make(map[string]int),
+		pending:   make(map[string]apiclient.Session),
+		preAuthIP: make(map[string]int),
+		base:      context.Background(),
 	}
 	sc := &ssh.ServerConfig{
 		PasswordCallback:          s.passwordCallback,
@@ -154,13 +173,13 @@ func (c Config) withDefaults() (Config, error) {
 	if c.Addr == "" {
 		c.Addr = defaultAddr
 	}
-	if c.IdleTimeout < 0 || c.CheckInterval < 0 || c.LoginTimeout < 0 {
+	if c.IdleTimeout < 0 || c.CheckInterval < 0 || c.LoginTimeout < 0 || c.RevalidateWithin < 0 {
 		return c, errors.New("sshserver: negative timeout")
 	}
 	if c.MaxSessionsPerUser < 0 {
 		return c, errors.New("sshserver: negative session cap")
 	}
-	if c.MaxPreAuthConnections < 0 {
+	if c.MaxPreAuthConnections < 0 || c.MaxPreAuthPerIP < 0 {
 		return c, errors.New("sshserver: negative pre-auth connection cap")
 	}
 	if c.IdleTimeout == 0 {
@@ -172,11 +191,17 @@ func (c Config) withDefaults() (Config, error) {
 	if c.MaxPreAuthConnections == 0 {
 		c.MaxPreAuthConnections = defaultMaxPreAuth
 	}
+	if c.MaxPreAuthPerIP == 0 {
+		c.MaxPreAuthPerIP = defaultMaxPreAuthIP
+	}
 	if c.CheckInterval == 0 {
 		c.CheckInterval = defaultCheckInterval
 	}
 	if c.LoginTimeout == 0 {
 		c.LoginTimeout = defaultLoginTimeout
+	}
+	if c.RevalidateWithin == 0 {
+		c.RevalidateWithin = defaultRevalidate
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
@@ -239,7 +264,8 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 			_ = raw.Close()
 			continue
 		}
-		if !s.acquirePreAuth() {
+		ip := sourceIP(raw.RemoteAddr())
+		if !s.acquirePreAuth(ip) {
 			s.untrack(raw)
 			_ = raw.Close()
 			s.metrics.preAuthRejected()
@@ -250,7 +276,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		go func() {
 			defer wg.Done()
 			defer s.untrack(raw)
-			s.handle(ctx, raw, sync.OnceFunc(s.releasePreAuth))
+			s.handle(ctx, raw, sync.OnceFunc(func() { s.releasePreAuth(ip) }))
 		}()
 	}
 	s.shutdown()
@@ -287,22 +313,57 @@ func (s *Server) track(c net.Conn) bool {
 	return true
 }
 
-// acquirePreAuth takes one pre-authentication slot, or reports that the cap
-// is reached.
-func (s *Server) acquirePreAuth() bool {
+// acquirePreAuth takes one pre-authentication slot for source IP ip, or
+// reports that the global or the per-IP cap is reached.
+func (s *Server) acquirePreAuth(ip string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.preAuth >= s.cfg.MaxPreAuthConnections {
+	if s.preAuth >= s.cfg.MaxPreAuthConnections || s.preAuthIP[ip] >= s.cfg.MaxPreAuthPerIP {
 		return false
 	}
 	s.preAuth++
+	s.preAuthIP[ip]++
 	return true
 }
 
-func (s *Server) releasePreAuth() {
+func (s *Server) releasePreAuth(ip string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.preAuth--
+	if n := s.preAuthIP[ip] - 1; n > 0 {
+		s.preAuthIP[ip] = n
+	} else {
+		delete(s.preAuthIP, ip)
+	}
+}
+
+// sourceIP returns the IP part of a connection's remote address, or the whole
+// address when it has no port.
+func sourceIP(a net.Addr) string {
+	if a == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(a.String())
+	if err != nil {
+		return a.String()
+	}
+	return host
+}
+
+// Revoke closes the connection that holds session token tok, as when the
+// API reports it revoked. The file system calls it when the API refuses the
+// session on a file request, so a revoked session does not wait for the next
+// check. An unknown token is ignored.
+func (s *Server) Revoke(tok string) {
+	s.mu.Lock()
+	st := s.tokens[tok]
+	s.mu.Unlock()
+	if st == nil || !st.revoked.CompareAndSwap(false, true) {
+		return
+	}
+	s.log.Info("session refused by the API; connection closed", "user", st.user)
+	s.metrics.revoked()
+	_ = st.sconn.Close()
 }
 
 // endSession tells the API to close a session this server created but will
@@ -345,6 +406,17 @@ type connState struct {
 	key         string // lowercased user, the per-user cap key
 	sftpStarted atomic.Bool
 	revoked     atomic.Bool
+	channels    atomic.Int32 // session channels accepted and not yet finished
+	// ttl is how long the API keeps the session valid without use, taken
+	// from the expiry at login. validUntil (Unix nanoseconds) is the latest
+	// time the session can still be valid without a new confirmation.
+	ttl        time.Duration
+	validUntil atomic.Int64
+}
+
+// confirm records that the API reported the session valid at t.
+func (st *connState) confirm(t time.Time, within time.Duration) {
+	st.validUntil.Store(t.Add(min(within, st.ttl)).UnixNano())
 }
 
 // handle runs one TCP connection from handshake to close. releasePreAuth
@@ -385,7 +457,9 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, releasePreAuth func()
 	dc.idle.Store(int64(s.cfg.IdleTimeout))
 	dc.touch()
 
-	st := &connState{sconn: sconn, sess: sess, user: sess.User, key: strings.ToLower(sess.User)}
+	now := time.Now()
+	st := &connState{sconn: sconn, sess: sess, user: sess.User, key: strings.ToLower(sess.User), ttl: sess.ExpiresAt.Sub(now)}
+	st.confirm(now, s.cfg.RevalidateWithin)
 	if !s.admit(st) {
 		s.endSession(ctx, sess)
 		s.metrics.login(loginLimit)
@@ -406,9 +480,15 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, releasePreAuth func()
 			_ = nc.Reject(ssh.UnknownChannelType, "only session channels")
 			continue
 		}
+		if st.channels.Add(1) > maxSessionChannels {
+			st.channels.Add(-1)
+			_ = nc.Reject(ssh.ResourceShortage, "too many channels")
+			continue
+		}
 		channels.Add(1)
 		go func() {
 			defer channels.Done()
+			defer st.channels.Add(-1)
 			s.serveSession(nc, st)
 		}()
 	}
@@ -428,6 +508,9 @@ func (s *Server) establish(ctx context.Context, sconn *ssh.ServerConn, pwSess ap
 		return apiclient.Session{}, errPermissionDenied
 	}
 	sess, err := sessionFromExtensions(perms.Extensions)
+	if err == nil && !sess.ExpiresAt.After(time.Now()) {
+		err = errors.New("sshserver: session already expired")
+	}
 	if err != nil {
 		if hasPW {
 			s.endSession(ctx, pwSess)
@@ -556,6 +639,16 @@ func (s *Server) serveSession(nc ssh.NewChannel, st *connState) {
 	if err != nil {
 		return
 	}
+	// A channel must start the SFTP subsystem within LoginTimeout, or it is
+	// closed. initState is 0 while waiting, 1 once a subsystem request won the
+	// race, 2 once the deadline closed the channel.
+	var initState atomic.Int32
+	initTimer := time.AfterFunc(s.cfg.LoginTimeout, func() {
+		if initState.CompareAndSwap(0, 2) {
+			_ = ch.Close()
+		}
+	})
+	defer initTimer.Stop()
 	var sftpDone sync.WaitGroup
 	// mine is set once this channel runs the connection's sftp subsystem.
 	// While another channel runs it, this one is an extra: every request is
@@ -570,7 +663,7 @@ func (s *Server) serveSession(nc ssh.NewChannel, st *connState) {
 	for req := range reqs {
 		switch req.Type {
 		case "subsystem":
-			if name, ok := subsystemName(req.Payload); !ok || name != sftpSubsystem || !st.sftpStarted.CompareAndSwap(false, true) {
+			if name, ok := subsystemName(req.Payload); !ok || name != sftpSubsystem || !initState.CompareAndSwap(0, 1) || !st.sftpStarted.CompareAndSwap(false, true) {
 				refuse(req)
 				continue
 			}
@@ -635,16 +728,23 @@ func (s *Server) checkOnce(ctx context.Context) {
 	if len(tokens) == 0 {
 		return
 	}
+	// The confirmation time is taken before the request, so a slow answer
+	// never extends a session past what the API actually saw.
+	asked := time.Now()
 	cctx, cancel := context.WithTimeout(ctx, s.cfg.LoginTimeout)
 	defer cancel()
 	revoked, err := s.api.CheckSessions(cctx, tokens)
 	if err != nil {
-		// Keep the connections. Failing open is not a revocation, and
-		// closing on a transient API error would drop healthy users.
-		s.log.Warn("session check failed; connections kept", "err", err)
+		// One failed check keeps the connections, so a short API blip does
+		// not drop healthy users. A session left unconfirmed for
+		// RevalidateWithin, or past its expiry, is closed by expireStale.
+		s.log.Warn("session check failed", "err", err)
+		s.expireStale(time.Now())
 		return
 	}
+	gone := make(map[string]struct{}, len(revoked))
 	for _, tok := range revoked {
+		gone[tok] = struct{}{}
 		s.mu.Lock()
 		st := s.tokens[tok]
 		s.mu.Unlock()
@@ -653,6 +753,38 @@ func (s *Server) checkOnce(ctx context.Context) {
 		}
 		s.log.Info("session revoked", "user", st.user)
 		s.metrics.revoked()
+		_ = st.sconn.Close()
+	}
+	s.mu.Lock()
+	for _, tok := range tokens {
+		if _, isGone := gone[tok]; isGone {
+			continue
+		}
+		if st := s.tokens[tok]; st != nil {
+			st.confirm(asked, s.cfg.RevalidateWithin)
+		}
+	}
+	s.mu.Unlock()
+	s.expireStale(time.Now())
+}
+
+// expireStale closes every connection whose session has not been confirmed
+// by the API recently enough to still be valid (fail closed).
+func (s *Server) expireStale(now time.Time) {
+	s.mu.Lock()
+	var stale []*connState
+	for _, st := range s.tokens {
+		if now.UnixNano() > st.validUntil.Load() {
+			stale = append(stale, st)
+		}
+	}
+	s.mu.Unlock()
+	for _, st := range stale {
+		if !st.revoked.CompareAndSwap(false, true) {
+			continue
+		}
+		s.log.Info("session not confirmed by the API; connection closed", "user", st.user)
+		s.metrics.unconfirmed()
 		_ = st.sconn.Close()
 	}
 }
