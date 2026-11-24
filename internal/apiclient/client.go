@@ -125,7 +125,7 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if strings.HasPrefix(base, "http://") && !cfg.AllowInsecureHTTP {
+	if u, _ := url.Parse(base); u.Scheme == "http" && !cfg.AllowInsecureHTTP {
 		return nil, errors.New("apiclient: base URL must use https (http needs AllowInsecureHTTP)")
 	}
 	pool, err := loadCAPool(cfg.CAFile)

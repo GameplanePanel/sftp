@@ -13,8 +13,10 @@ import (
 )
 
 func TestNewRequiresHTTPSByDefault(t *testing.T) {
-	if _, err := New(Config{BaseURL: "http://gameplane-api.gameplane.svc"}); err == nil {
-		t.Fatal("New accepted an http base URL without AllowInsecureHTTP")
+	for _, raw := range []string{"http://gameplane-api.gameplane.svc", "HTTP://gameplane-api.gameplane.svc", " Http://api.example/ "} {
+		if _, err := New(Config{BaseURL: raw}); err == nil {
+			t.Errorf("New(%q) accepted an http base URL without AllowInsecureHTTP", raw)
+		}
 	}
 	c, err := New(Config{BaseURL: "http://gameplane-api.gameplane.svc", AllowInsecureHTTP: true})
 	if err != nil {
