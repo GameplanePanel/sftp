@@ -55,20 +55,25 @@ type Options struct {
 	OnBytes func(direction string, n int)
 	// Logger receives debug logs. Nil discards them.
 	Logger *slog.Logger
+	// OnUnauthorized is called when the API refuses the session token (HTTP
+	// 401) on a file request, so the connection can be closed at once. May
+	// be nil.
+	OnUnauthorized func()
 }
 
 // FS is the virtual file system of one authenticated SSH connection. It is
 // safe for concurrent use by the SFTP request workers.
 type FS struct {
-	api     API
-	token   string
-	user    string
-	target  *apiclient.Target
-	started time.Time
-	defNS   string
-	limiter *Limiter
-	onBytes func(direction string, n int)
-	log     *slog.Logger
+	api      API
+	token    string
+	user     string
+	target   *apiclient.Target
+	started  time.Time
+	defNS    string
+	limiter  *Limiter
+	onBytes  func(direction string, n int)
+	onUnauth func()
+	log      *slog.Logger
 
 	mu       sync.Mutex
 	loaded   bool
@@ -88,15 +93,16 @@ func New(api API, session apiclient.Session, opts Options) *FS {
 		lg = slog.New(slog.DiscardHandler)
 	}
 	return &FS{
-		api:     api,
-		token:   session.Token,
-		user:    strings.ToLower(session.User),
-		target:  session.Target,
-		started: time.Now(),
-		defNS:   ns,
-		limiter: opts.Limiter,
-		onBytes: opts.OnBytes,
-		log:     lg,
+		api:      api,
+		token:    session.Token,
+		user:     strings.ToLower(session.User),
+		target:   session.Target,
+		started:  time.Now(),
+		defNS:    ns,
+		limiter:  opts.Limiter,
+		onBytes:  opts.OnBytes,
+		onUnauth: opts.OnUnauthorized,
+		log:      lg,
 	}
 }
 
