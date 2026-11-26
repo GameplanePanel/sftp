@@ -8,7 +8,7 @@ This repository holds the optional SFTP endpoint for game server files (spec 040
 - **CI** is `.github/workflows/ci.yaml`, a thin caller of Gameplane's shared [`go-component.yaml`](https://github.com/GameplanePanel/Gameplane/blob/master/.github/workflows/go-component.yaml), pinned by SHA: lint with Gameplane's root `.golangci.yml` and `.hadolint.yaml` (no copy here), race tests on amd64 and arm64 with the `.testcoverage.yml` gate, govulncheck, and an image build. Dependabot runs in this repository.
 - **Images** `sftp` (`Dockerfile`, built by `make image-sftp`) are built and published from the Gameplane repository root: the Dockerfiles copy `sftp/...` from that build context.
 - **Callers live in Gameplane:** paths such as `operator/`, `api/`, `charts/`, `docs/` and `web/` in `specs.md` and code comments refer to that repository.
-- **Shipping a change:** PR to `main` here → after it merges, bump the `sftp` pointer in Gameplane (`git -C sftp checkout <merged sha on main>`, `git add sftp`) in a Gameplane PR. A user-visible change gets its `changelog/unreleased/` entry in that Gameplane PR.
+- **Shipping a change:** PR to `master` here → after it merges, bump the `sftp` pointer in Gameplane (`git -C sftp checkout <merged sha on master>`, `git add sftp`) in a Gameplane PR. A user-visible change gets its `changelog/unreleased/` entry in that Gameplane PR.
 
 ## Rules
 
