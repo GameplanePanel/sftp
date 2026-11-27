@@ -49,7 +49,9 @@ func (f *FS) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if !ok {
 		return nil, failure("too many concurrent transfers")
 	}
-	return newWriter(ctx, f, files, loc.rest, release, flags.Creat || flags.Trunc, !exists || flags.Trunc), nil
+	// An existing file opened without O_TRUNC is left untouched when nothing is written.
+	create := (!exists && flags.Creat) || flags.Trunc
+	return newWriter(ctx, f, files, loc.rest, release, create, !exists || flags.Trunc), nil
 }
 
 // Limits on how far out of order a client's writes may arrive. pkg/sftp
@@ -76,7 +78,7 @@ type writer struct {
 	fs        *FS
 	files     *apiclient.Files
 	path      string
-	create    bool // Creat or Trunc was set: a write-less close still creates the file
+	create    bool // a new file opened with Creat, or any Trunc: a write-less close still creates an empty file (an existing file opened without Trunc is left unchanged)
 	baseKnown bool // the stream must start at offset 0 (new or truncated file)
 	release   func()
 	pr        *io.PipeReader
@@ -266,8 +268,9 @@ func (w *writer) TransferError(err error) {
 }
 
 // Close ends the upload. A clean end commits it. An aborted upload, or one
-// with a gap that never filled, commits nothing. An unstarted create or
-// truncate with no data makes an empty file. Close is idempotent.
+// with a gap that never filled, commits nothing. An unstarted create of a new
+// file, or an unstarted truncate, with no data makes an empty file. An existing
+// file opened without truncation is left unchanged. Close is idempotent.
 func (w *writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
