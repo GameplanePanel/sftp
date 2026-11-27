@@ -285,7 +285,6 @@ func runServe(args []string, getenv func(string) string, errOut io.Writer) error
 		}).Handlers()
 	}
 	srv, err = sshserver.New(sshserver.Config{
-		Addr:                  cfg.Listen,
 		HostKeys:              hostKeys,
 		IdleTimeout:           cfg.IdleTimeout,
 		MaxSessionsPerUser:    cfg.MaxSessionsPerUser,

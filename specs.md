@@ -22,7 +22,7 @@ Optional SFTP endpoint, one per cluster, that gives users SFTP access to the fil
 ## Directory & package layout
 
 - `main.go`: entrypoint, subcommand dispatch (`serve`, `version`), flag and environment parsing, wiring, metrics HTTP server.
-- `internal/apiclient`: HTTP client for the API: login, session check, server list, and the file routes. Sentinel errors (`ErrNotFound`, `ErrPermission`, ...) map HTTP statuses.
+- `internal/apiclient`: HTTP client for the API: login, session check, session end, server list, and the file routes. Sentinel errors (`ErrNotFound`, `ErrPermission`, ...) map HTTP statuses.
 - `internal/sshserver`: SSH listener, authentication callbacks, session registry, revocation loop, idle timeout, host key loading, metrics.
 - `internal/vfs`: the per-connection virtual file system (`pkg/sftp` handlers), path translation, read and write streaming, transfer limiter.
 
@@ -93,11 +93,10 @@ On `--metrics-addr` at `GET /metrics` only (private registry; read, write and id
 ## Security considerations
 
 - Authentication failures are generic (core rule 3); rate limiting of failed logins is done by the API per user and per source address, using the client address this server forwards.
-- The service token authorises only login and session checks; file operations use the user's own short-lived session token, which the API restricts to the SFTP routes.
+- The service token authorises only login, session checks and session end; file operations use the user's own short-lived session token, which the API restricts to the SFTP routes.
 - Host keys must be stable across restarts (mounted from a Secret); they are read through `os.Root`, so a path cannot escape its directory.
 - The API URL must be `https`, with the certificate checked against the system roots plus `--ca-file`; plain `http` needs `--allow-insecure-api`, which the chart sets only in local mode, where the hop is pod to pod inside the cluster behind the SFTP NetworkPolicy. The client never follows a redirect: a 3xx answer fails the call, so the password, key or token is never re-sent to another URL.
 - `/metrics` has no authentication and is loopback-only by default. The chart binds it to the pod address only when a ServiceMonitor scrapes it, behind a NetworkPolicy rule for the scrape namespace, and never adds it to the public SFTP Service.
-- The session-end route `POST /sftp/v1/sessions/end` is not yet in the Gameplane API contract (`specs/040-sftp-access/contracts/api.md`). Until the API implements it, the call fails (logged at debug level) and an unused session expires on its own.
 
 ## Testing & coverage
 
