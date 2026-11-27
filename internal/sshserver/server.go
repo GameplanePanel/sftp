@@ -22,7 +22,6 @@ import (
 )
 
 const (
-	defaultAddr          = ":2222"
 	defaultIdleTimeout   = 15 * time.Minute
 	defaultMaxSessions   = 4
 	defaultMaxPreAuth    = 64
@@ -69,9 +68,6 @@ type HandlerFactory func(sess apiclient.Session, user string) sftp.Handlers
 // Config configures a Server. Zero values take the defaults documented on
 // each field.
 type Config struct {
-	// Addr is the listen address the caller binds. Serve takes the listener,
-	// so Addr is informational. Default ":2222".
-	Addr string
 	// HostKeys are the server's host keys. At least one is required.
 	HostKeys []ssh.Signer
 	// IdleTimeout closes an authenticated connection with no traffic for
@@ -170,9 +166,6 @@ func New(cfg Config, api API, hf HandlerFactory) (*Server, error) {
 }
 
 func (c Config) withDefaults() (Config, error) {
-	if c.Addr == "" {
-		c.Addr = defaultAddr
-	}
 	if c.IdleTimeout < 0 || c.CheckInterval < 0 || c.LoginTimeout < 0 || c.RevalidateWithin < 0 {
 		return c, errors.New("sshserver: negative timeout")
 	}
@@ -554,13 +547,16 @@ func (s *Server) atLimit(user string) bool {
 // passwordCallback logs the user in through the API. Its error is always the
 // generic permission-denied error.
 func (s *Server) passwordCallback(conn ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
+	return s.login(conn, apiclient.LoginRequest{Password: string(pw)})
+}
+
+// login asks the API to accept the credential in req for the connecting user.
+func (s *Server) login(conn ssh.ConnMetadata, req apiclient.LoginRequest) (*ssh.Permissions, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.LoginTimeout)
 	defer cancel()
-	sess, err := s.api.Login(ctx, apiclient.LoginRequest{
-		Username:   conn.User(),
-		Password:   string(pw),
-		RemoteAddr: conn.RemoteAddr().String(),
-	})
+	req.Username = conn.User()
+	req.RemoteAddr = conn.RemoteAddr().String()
+	sess, err := s.api.Login(ctx, req)
 	if err != nil {
 		s.loginFailed(conn.User(), conn.RemoteAddr().String(), err)
 		return nil, errPermissionDenied
@@ -608,18 +604,7 @@ func (s *Server) verifiedPublicKeyCallback(conn ssh.ConnMetadata, _ ssh.PublicKe
 	if line == "" {
 		return nil, errPermissionDenied
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.LoginTimeout)
-	defer cancel()
-	sess, err := s.api.Login(ctx, apiclient.LoginRequest{
-		Username:   conn.User(),
-		PublicKey:  line,
-		RemoteAddr: conn.RemoteAddr().String(),
-	})
-	if err != nil {
-		s.loginFailed(conn.User(), conn.RemoteAddr().String(), err)
-		return nil, errPermissionDenied
-	}
-	return s.loggedIn(conn, sess)
+	return s.login(conn, apiclient.LoginRequest{PublicKey: line})
 }
 
 func (s *Server) loginFailed(user, remote string, err error) {

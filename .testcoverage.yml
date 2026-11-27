@@ -1,7 +1,7 @@
 # Coverage threshold gate for the sftp module.
 # Enforced in CI by Gameplane's shared go-component.yaml workflow (go-test-coverage/v2).
-# The scaffold only has run(); main() is process wiring. Ratchet up as the
-# SSH server, API client and virtual file system land (spec 040 T020-T029).
+# main() is process wiring and is not unit-tested; the SSH server, API client
+# and virtual file system are covered by their own package tests.
 profile: coverage/unit.out
 github-action-output: false
 

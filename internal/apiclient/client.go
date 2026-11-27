@@ -99,11 +99,6 @@ type Config struct {
 	ServiceToken string
 	// CAFile is an optional PEM bundle appended to the system roots.
 	CAFile string
-	// Timeout bounds non-streaming calls. Zero means 30 seconds. Streaming
-	// calls (Download and Stream) are bounded by their context only.
-	Timeout time.Duration
-	// UserAgent is sent on every request. Empty means "gameplane-sftp".
-	UserAgent string
 }
 
 // Client talks to the Gameplane API. It is safe for concurrent use.
@@ -141,17 +136,15 @@ func New(cfg Config) (*Client, error) {
 		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool},
 	}
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = defaultTimeout
-	}
-	hc := &http.Client{Transport: tr, Timeout: timeout, CheckRedirect: refuseRedirect}
+	// Streaming calls (Download and Stream) use the second client and are
+	// bounded by their context only.
+	hc := &http.Client{Transport: tr, Timeout: defaultTimeout, CheckRedirect: refuseRedirect}
 	stream := &http.Client{Transport: tr, CheckRedirect: refuseRedirect}
 	return newClient(base, cfg, hc, stream), nil
 }
 
 // NewWithHTTPClient builds a Client that sends every request through hc. It
-// is meant for tests; CAFile and Timeout in cfg are ignored because hc owns
+// is meant for tests; CAFile in cfg is ignored because hc owns
 // TLS and timeouts.
 func NewWithHTTPClient(cfg Config, hc *http.Client) (*Client, error) {
 	base, err := validateBaseURL(cfg.BaseURL)
@@ -179,14 +172,10 @@ func LoadServiceToken(path string) (string, error) {
 }
 
 func newClient(base string, cfg Config, hc, stream *http.Client) *Client {
-	ua := cfg.UserAgent
-	if ua == "" {
-		ua = defaultUserAgent
-	}
 	return &Client{
 		baseURL:      base,
 		serviceToken: strings.TrimSpace(cfg.ServiceToken),
-		userAgent:    ua,
+		userAgent:    defaultUserAgent,
 		hc:           hc,
 		streamHC:     stream,
 	}
